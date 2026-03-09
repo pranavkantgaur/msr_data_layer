@@ -601,6 +601,386 @@ pytest -v
 
 ---
 
+## Integrating with MSR Digital Twin Architectures
+
+This data layer is intentionally architecture-agnostic: it exposes a stable MCP
+interface on top of whatever plant data source and knowledge base you configure.
+The sections below describe the concrete interfaces you need to implement to
+connect it to the major MSR digital twin patterns documented in the literature,
+grouped by **reactor lifecycle phase**.
+
+> **Key principle:** The data layer reads, stores, and surfaces information.
+> Simulation, control, and physics calculations remain in the digital twin.
+> The data layer never *drives* the twin — it feeds it and learns from it.
+
+---
+
+### Phase 1 – Design
+
+During the design phase agents and engineers use the data layer primarily as a
+**knowledge retrieval and multi-physics data hub**.  The relevant digital twin
+architectures are model-based design tools (MOOSE, SAM, ARMI) and early-stage
+FPGA/hardware emulation.
+
+#### 1a. Python-Based Unified API (ARMI-style)
+
+[ARMI](https://github.com/terrapower/armi) provides a single authoritative
+data model that lets disparate physics kernels (neutronics, thermal-hydraulics,
+fuel performance) share geometry and material data.  To use the data layer as
+the knowledge backbone for an ARMI-driven design workflow:
+
+```python
+# Ingest ARMI run outputs into the knowledge base
+from msr_kb_sources import PlantDataLoader
+from msr_digital_twin_with_rag import MSRDigitalTwinRAG
+
+rag = MSRDigitalTwinRAG()
+loader = PlantDataLoader()
+
+# After each ARMI case run, push the result summary into the KB
+armi_summary = """
+ARMI case: FLiBe-MSR nominal design
+  neutron_flux_peak: 2.5e13 n/cm²/s
+  core_outlet_temp: 704°C
+  cycle_length_efpd: 365
+"""
+loader.ingest_text(rag, armi_summary,
+                   source_id="armi-nominal-v1",
+                   data_type="operational_data")
+
+# Now query design trade-offs via RAG
+answer = rag.answer("What core outlet temperature maximises cycle length "
+                    "without exceeding FLiBe freezing limits?")
+```
+
+#### 1b. RESTful / GraphQL Hub (Deep Lynx–style)
+
+For large design projects that integrate multiple engineering tools via a data
+warehouse (e.g. [Deep Lynx](https://github.com/idaholab/Deep-Lynx)), configure
+`MSR_PLANT_DATA_URL` to point at your warehouse's sensor/parameter export
+endpoint and post design-phase documents to the `/data/ingest` HTTP endpoint:
+
+```bash
+# Point the data layer at Deep Lynx's plant-parameter export
+export MSR_PLANT_DATA_URL=https://deep-lynx.example.com/api/v1/containers/<id>/data/query
+
+# Ingest a MOOSE thermal-hydraulics result report
+curl -X POST https://<api>/prod/data/ingest \
+     -H "Content-Type: application/json" \
+     -d '{
+       "content": "MOOSE TH result: peak cladding temp 712°C at 110% power",
+       "data_type": "operational_data",
+       "source_id": "moose-th-110pct-power"
+     }'
+```
+
+**Metadata and tagging:** include a structured `source_id` that encodes the
+equipment tag and version (e.g. `moose-HX1-rev3`) so the RAG pipeline can
+filter results by component.
+
+#### 1c. RTL I/O Port Interface (FPGA-HLS HIL)
+
+For FPGA-based real-time digital twins that use High-Level Synthesis (HLS),
+the data layer acts as the software-side partner that feeds plant parameter
+snapshots into the HLS testbench.  Map the data layer's JSON sensor output to
+your RTL I/O ports:
+
+```python
+import json, urllib.request
+
+# Pull a snapshot from the data layer
+resp = urllib.request.urlopen("http://localhost:3000/mcp", ...)
+state = json.loads(resp.read())
+
+# Map to HLS C++ struct / RTL port values
+hls_input = {
+    "core_temp_in":    state["core_temperature_c"],   # ap_fixed<32,10>
+    "flow_rate_in":    state["salt_flow_rate_kg_s"],  # ap_fixed<32,10>
+    "power_in":        state["reactor_power_mw"],     # ap_fixed<32,10>
+}
+# Write hls_input to shared memory or a FIFO consumed by the HLS testbench
+```
+
+**Buffer memory mapping:** for fission time-delay models that rely on BRAM-backed
+ring buffers, use `get_sensor_history` (returns the last *N* readings as a list)
+to fill the initial buffer state before the FPGA simulation starts:
+
+```python
+from msr_digital_twin_client import MSRDataLayerClient
+with MSRDataLayerClient() as client:
+    history = client.get_sensor_history("neutron_flux_n_cm2_s", last_n=64)
+ring_buffer = history["values"]   # push into BRAM via driver
+```
+
+---
+
+### Phase 2 – Construction
+
+During construction the data layer bridges **commissioning test records** and
+**as-built inspection reports** into the knowledge base, so agents can answer
+questions like "were all welds on loop A pressure-tested?" or "what was the
+baseline core temperature during cold commissioning?".
+
+#### 2a. Ingesting Commissioning and Inspection Records
+
+Use `PlantDataLoader` to ingest commissioning test records as they are
+completed.  Pair each record with a stable `source_id` that encodes the
+equipment tag from the Bill of Materials (BOM):
+
+```python
+from msr_kb_sources import PlantDataLoader
+loader = PlantDataLoader()
+
+# Hydrostatic pressure test result for loop A
+loader.ingest_text(
+    rag,
+    "Loop-A hydrostatic test: 12 bar for 4 h. No leaks. Date: 2025-03-01.",
+    source_id="commissioning-loop-A-hydro-20250301",
+    data_type="maintenance_report",
+)
+
+# Baseline sensor calibration record
+loader.ingest_text(
+    rag,
+    "TC-101 calibrated against NIST standard. Offset: +0.3°C. Cal date: 2025-03-05.",
+    source_id="cal-TC-101-20250305",
+    data_type="maintenance_report",
+)
+```
+
+#### 2b. Bitstream / Firmware Configuration Tracking
+
+For digital twins that reconfigure virtual logic between commissioning phases
+(e.g. switching from pre-operational to operational control logic), log the
+configuration change through the data layer so the knowledge base retains a
+history of which bitstream/firmware was active during each test:
+
+```python
+loader.ingest_text(
+    rag,
+    "FPGA bitstream v2.1.0 loaded 2025-03-10. "
+    "Includes updated fission time-delay model for full-power operation.",
+    source_id="fpga-bitstream-v2.1.0",
+    data_type="operational_data",
+)
+```
+
+#### 2c. Asynchronous Metadata Exchange
+
+For multi-organization projects the data layer's HTTP endpoints support
+**fire-and-forget ingestion** without tight time-step coupling.  Configure
+your construction management system to `POST /data/ingest` whenever a
+milestone is completed:
+
+```bash
+# Triggered by a CI/CD pipeline or work-order system
+curl -X POST https://<api>/prod/data/ingest \
+     -H "X-Api-Key: $MSR_API_KEY" \
+     -d '{
+       "content": "Primary pump PP-01 hydro test passed. WO#: 48291.",
+       "data_type": "maintenance_report",
+       "source_id": "wo-48291-PP01-hydro"
+     }'
+```
+
+---
+
+### Phase 3 – Operations
+
+During steady-state operations the data layer is the **live sensor gateway and
+operational memory**.  The relevant digital twin patterns are health-aware
+supervisory control (Ensemble Kalman Filter recalibration) and reinforcement
+learning–based O&M scheduling.
+
+#### 3a. Physical-to-Virtual (P2V) Streaming — Ensemble Kalman Filter
+
+For architectures that recalibrate a virtual model using an Ensemble Kalman
+Filter (EnKF), the data layer provides the observational measurement stream
+*d* and the associated measurement noise covariance Γ.  Implement an adapter
+that polls `get_all_sensor_readings` at your required assimilation frequency:
+
+```python
+import time, numpy as np
+from msr_digital_twin_client import MSRDataLayerClient
+
+def stream_to_enkf(enkf, dt_seconds: float = 60.0):
+    """
+    Stream live sensor readings (d) and a diagonal measurement-noise
+    covariance matrix (Γ) to an EnKF at the requested frequency.
+    """
+    with MSRDataLayerClient() as client:
+        while True:
+            snapshot = client.get_all_sensor_readings()
+
+            # Build observation vector d
+            sensors = ["core_temperature_c", "reactor_power_mw",
+                       "salt_flow_rate_kg_s", "primary_loop_pressure_bar"]
+            d = np.array([snapshot["readings"][s]["value"] for s in sensors])
+
+            # Measurement-noise covariance Γ (instrument uncertainties, ±1σ)
+            noise_1sigma = np.array([0.5, 0.2, 1.0, 0.005])  # °C, MW, kg/s, bar
+            gamma = np.diag(noise_1sigma ** 2)
+
+            # Hand off to the EnKF
+            enkf.assimilate(d, gamma)
+
+            time.sleep(dt_seconds)
+```
+
+> **Variable time-step:** for transient capture (seconds) vs. long-term
+> monitoring (hours), simply change `dt_seconds`.  The data layer's in-memory
+> history buffer (`get_sensor_history`) retains up to 1 000 samples so you
+> can backfill missed assimilation steps.
+
+#### 3b. Parameter Augmentation Portal
+
+When the virtual model's trainable coefficients (e.g. VARMAX parameters or
+neural-network weights) are updated after each EnKF cycle, log the new
+parameters through the data layer so the knowledge base tracks model evolution:
+
+```python
+updated_params = {"varmax_ar_coef": [0.91, 0.07], "varmax_ma_coef": [0.12]}
+loader.ingest_text(
+    rag,
+    f"EnKF parameter update cycle 47: {updated_params}",
+    source_id="enkf-params-cycle-047",
+    data_type="operational_data",
+)
+```
+
+#### 3c. Virtual-to-Physical (V2P) Decision Loop — RL Set-Points
+
+For architectures that use a Reinforcement Learning supervisor (e.g. Soft
+Actor Critic) to generate optimised power set-points, the data layer acts as
+the **audit log** for V2P commands.  Before a set-point is dispatched to the
+plant control system, record it through the data layer for traceability:
+
+```python
+def dispatch_setpoint(rl_agent, plant_control_api):
+    action = rl_agent.select_action(current_state)
+
+    # Log the proposed set-point in the knowledge base
+    loader.ingest_text(
+        rag,
+        f"RL set-point proposed: power={action['power_mw']:.1f} MW, "
+        f"flow={action['flow_kg_s']:.1f} kg/s at {datetime.utcnow().isoformat()}Z",
+        source_id=f"rl-setpoint-{int(time.time())}",
+        data_type="event_log",
+    )
+
+    # Send to plant
+    plant_control_api.send_setpoint(action)
+```
+
+#### 3d. Constraint Enforcement (Reference Governor)
+
+Before dispatching a set-point you can query the knowledge base via RAG for
+safety-boundary context, providing a lightweight pre-check without calling the
+full physics model:
+
+```python
+safety_context = rag.answer(
+    f"Is a mass flow rate of {action['flow_kg_s']:.1f} kg/s within the "
+    "safe operating envelope at the proposed power level?"
+)
+# Log the safety check result alongside the set-point
+loader.ingest_text(rag, f"Safety pre-check: {safety_context}",
+                   source_id=f"safety-check-{int(time.time())}",
+                   data_type="event_log")
+```
+
+---
+
+### Phase 4 – Monitoring (Long-Term Health and Degradation)
+
+Long-term monitoring requires the data layer to accumulate **aging and
+degradation evidence** and surface it on demand, without requiring tight
+time-step integration with the physics model.
+
+#### 4a. Surrogate Compression Interface (RL Offline Data)
+
+For training RL agents on compressed hourly propagators the data layer serves
+as the **offline data archive**.  Ingest the propagator outputs as they are
+generated so they are searchable during future design or re-commissioning work:
+
+```python
+# After each surrogate batch run
+for batch_id, summary in surrogate_results.items():
+    loader.ingest_text(
+        rag,
+        f"Surrogate propagator batch {batch_id}: {summary}",
+        source_id=f"surrogate-batch-{batch_id}",
+        data_type="operational_data",
+    )
+```
+
+#### 4b. Aging and Degradation Records
+
+Use `maintenance_report` ingestion to build a longitudinal record of
+component health indicators.  The RAG pipeline can then synthesise trend
+analyses across this history:
+
+```python
+# Monthly heat-exchanger fouling check
+loader.ingest_text(
+    rag,
+    "HX-1 thermal resistance 2025-04: 0.00021 m²·K/W (+3% vs. baseline). "
+    "Fouling index: MODERATE. Recommended cleaning in 90 days.",
+    source_id="hx1-fouling-2025-04",
+    data_type="maintenance_report",
+)
+
+# Query degradation trend
+trend = rag.answer("What is the fouling trend for HX-1 over the past 12 months "
+                   "and when should the next cleaning be scheduled?")
+```
+
+#### 4c. Consistency Metadata Tagging
+
+To resolve data availability pain points and link physical parts to their
+virtual representations, adopt a structured `source_id` convention that
+encodes the equipment tag:
+
+```
+<system>-<component>-<data_type>-<ISO_date>
+  examples:
+    primary-HX1-fouling-2025-04
+    secondary-pump-PP01-vibration-2025-Q1
+    fpga-bitstream-v2.1.0
+    enkf-params-cycle-047
+```
+
+This makes it straightforward for agents to retrieve all data about a specific
+component:
+
+```python
+# Retrieve all knowledge-base entries tagged to HX-1
+results = rag._kb.search("HX-1 heat exchanger primary loop", top_k=20)
+hx1_entries = [r for r in results if "HX1" in r.get("source", "")]
+```
+
+---
+
+### Summary: Interface Matrix by Lifecycle Phase
+
+| Interface | Design | Construction | Operations | Monitoring |
+|---|:---:|:---:|:---:|:---:|
+| `MSR_PLANT_DATA_URL` (SCADA/historian) | | ✓ | ✓ | ✓ |
+| `PlantDataLoader.ingest_text` (maintenance/commissioning reports) | | ✓ | ✓ | ✓ |
+| `PlantDataLoader.ingest_sensor_snapshot` (sensor snapshots) | | ✓ | ✓ | ✓ |
+| `POST /data/ingest` (async HTTP ingestion) | | ✓ | ✓ | ✓ |
+| `rag.answer()` / `POST /query` (RAG knowledge retrieval) | ✓ | ✓ | ✓ | ✓ |
+| `POST /kb/update` (archive + OpenAlex ingestion) | ✓ | ✓ | | |
+| Sensor history buffer (`get_sensor_history`) | | | ✓ | ✓ |
+| Structured `source_id` tagging (BOM / equipment tags) | | ✓ | ✓ | ✓ |
+| P2V streaming adapter (EnKF assimilation loop) | | | ✓ | ✓ |
+| V2P audit log (RL set-point traceability) | | | ✓ | |
+| ARMI / Deep Lynx connector (`MSR_PLANT_DATA_URL` + ingestion) | ✓ | | | |
+| RTL I/O / BRAM bridge (`get_sensor_history` → HLS buffer) | ✓ | | | |
+| Surrogate offline archive (`operational_data` ingestion) | | | ✓ | ✓ |
+
+---
+
 ## Documentation
 
 * [00_MCP_START_HERE.md](00_MCP_START_HERE.md) – five-minute quick start
