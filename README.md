@@ -1171,282 +1171,378 @@ with the instruction to return when it had actually been built and run.
 
 ---
 
-## Supporting MSR Experimental Work: J. Nucl. Mater. (2025) Mapping
+## How the MSR Data Layer Assists the Lucas et al. (2025) Corrosion Study
 
-> **Article reference:** *Journal of Nuclear Materials*, 2025,
-> doi:10.1016/j.jnucmat.2025.155737 (PII S0022311525007913)
+> **Paper:** Lucas N., Woods R., Crombleholme S., Vandanapu H., Beer C.,
+> Sobel J., Steenberg T., Patel M.K. — *"Effect of Salt Purity on the
+> Corrosion of 316L SS: Long-Term Studies in Molten FLiNaK and ThF₄–LiF"*,
+> *Journal of Nuclear Materials* (2025), PII S0022311525007913.
+> Copenhagen Atomics A/S & University of Liverpool.
 >
-> The Journal of Nuclear Materials (ISSN 0022-3115) publishes experimental
-> materials-science work directly relevant to molten salt reactor development:
-> corrosion of structural alloys in fluoride/chloride salts, fission-product
-> speciation and transport, thermophysical property measurements of fuel and
-> coolant salts, redox-potential electrochemistry, and radiation-effects
-> characterisation.  The sections below map each major experimental workflow
-> phase to a specific data-layer capability.
+> The paper reports 18 static-immersion corrosion tests of **316L stainless
+> steel** coupons (Cr 16.9 wt%, Ni 10.7 wt%, Mo 2.6 wt%) in two molten
+> fluoride salt systems — **FLiNaK at 600 °C** and **LiThF (ThF₄-LiF) at
+> 700 °C** — comparing purified versus untreated salt over **1 000, 2 000,
+> and 3 000 h**.  Analysis methods include ICP-OES (Cr/Fe/Ni in salt),
+> mass change, SEM/EDS cross-sections, and GIXRD phase identification.
+
+The sections below show exactly where the data layer plugs into each phase of
+this experimental programme.
 
 ---
 
-### 1 — Pre-Experiment: Historical Context from ORNL Reports
+### 1 — Design Phase: Retrieving ORNL Baselines for 316L SS and INOR-8
 
-**Experimental need:** Before designing a new corrosion coupon experiment or
-salt-chemistry study, researchers must survey prior ORNL results — loop
-corrosion data from the 1960s–70s MSRE/MSBR programmes, tellurium
-embrittlement studies, fission-product volatility measurements — to avoid
-re-discovering known failure modes and to set realistic baseline values.
+**Paper connection:** The Introduction positions Copenhagen Atomics' 316L
+work against the MSRE/MSBR heritage of **Inconel** and **INOR-8** data —
+roughly 1 mm corrosion per 20 000 h.  Before running expensive 3 000 h tests
+the researchers must know what the ORNL reports actually measured, and under
+which salt-chemistry conditions those rates were achieved.
 
-**Data-layer capability:** The RAG pipeline pre-loads OCR transcripts from the
-`pranavkantgaur/msr-archive` GitHub repository, which contains the primary
-ORNL MSR technical reports.
+**Data-layer capability:** Ingest the ORNL OCR archive and query it directly.
 
 ```python
 from msr_digital_twin_with_rag import MSRDigitalTwinRAG
 
 rag = MSRDigitalTwinRAG()
-rag.load_msr_archive()   # one-time ingest; re-run adds only new files
+rag.load_msr_archive()   # one-time; re-runs add only new files
 
-# Query historical corrosion measurements
 answer = rag.answer(
-    "What corrosion rates were measured for Hastelloy N coupons in "
-    "FLiBe-UF4 at 650–700 °C during MSRE loop tests?"
+    "What mass-loss or corrosion-depth data exist in the ORNL reports for "
+    "316 stainless steel or INOR-8 coupons in FLiNaK at 600–700 °C? "
+    "Include experiment duration, temperature, and salt purity conditions."
 )
 print(answer)
 ```
 
 ```bash
-# CLI equivalent
 python msr_digital_twin_with_rag.py \
-  "Summarise ORNL fission-product volatility data for tellurium in FLiBe"
+  "Summarise ORNL MSRE container-material corrosion data for austenitic steels"
 ```
 
-This surfaces specific ORNL report numbers, measured values, and experimental
-conditions — giving the experimentalist a traceable prior-art baseline in
-seconds rather than hours of manual literature search.
+This surfaces specific ORNL report numbers and measured values — avoiding
+manual archive searches across dozens of 1960s technical reports — and
+establishes a traceable baseline against which the new 316L data can be
+benchmarked.
 
 ---
 
-### 2 — Pre-Experiment: Recent Literature Survey via OpenAlex
+### 2 — Design Phase: Surveying Recent 316L / FLiNaK Literature
 
-**Experimental need:** Knowing the current state of the art — which alloy
-compositions have been tested in FLiNaK since 2010, what redox-control
-strategies have been validated at bench scale — helps the researcher calibrate
-measurement uncertainty and choose appropriate control conditions.
+**Paper connection:** The paper cites competing work on chromium depletion in
+FLiNaK and on the role of moisture-derived HF in stainless steel attack.  The
+researchers need to know what corrosion depths and ICP-OES concentrations have
+already been reported for 316L in fluoride salts so they can frame their
+contribution and choose appropriate exposure durations.
 
-**Data-layer capability:** The OpenAlex loader queries the academic paper API
-for MSR-relevant experimental papers and ingests their abstracts into the
-knowledge base alongside the ORNL archive.
+**Data-layer capability:** The OpenAlex loader ingests papers matching MSR
+corrosion queries into the same vector store as the ORNL archive.
 
 ```bash
-# Pull all new MSR experimental papers from OpenAlex
 python msr_kb_sources.py --update-openalex
 ```
 
 ```python
-# After update, query spans both ORNL reports and recent literature
 answer = rag.answer(
-    "What chromium depletion depths have been reported for 316L SS "
-    "after 500 h immersion in FLiBe at 700 °C?"
+    "What chromium and iron dissolution rates have been reported for 316L SS "
+    "in FLiNaK or FLiBe in the last 10 years? "
+    "Include temperature, exposure time, and whether the salt was purified."
 )
 ```
 
-Because both the ORNL archive and OpenAlex papers live in the same vector
-store, a single query retrieves corroborating or contradicting evidence from
-six decades of published experimental work.
+A single query now spans six decades of literature — ORNL reports from the
+1960s and peer-reviewed papers from the 2010s–2020s — in one step.
 
 ---
 
-### 3 — During Experiment: Continuous Sensor Data Ingestion
+### 3 — During Experiment: Logging Furnace Conditions for All 18 Tests
 
-**Experimental need:** A molten-salt loop experiment typically runs continuously
-for hundreds to thousands of hours, generating time-series data from multiple
-sensors: furnace temperature controllers, thermal mass-flow meters, in-line
-redox probes (Pt/Ni reference electrodes), pressure transducers, and
-occasionally online gamma spectrometers tracking noble-metal fission products.
-This data must be stored in a queryable form alongside the experimental
-narrative.
+**Paper connection:** The 18 immersion tests (9 purified FLiNaK, 9 untreated
+FLiNaK) were run at **600 °C** under **0.3 bar Ar overpressure** inside an
+argon glovebox (&lt;10 ppm O₂ and H₂O).  Long-duration experiments (up to
+3 000 h ≈ 125 days) accumulate furnace controller logs, thermocouple readings,
+and glovebox atmosphere readings that must be preserved alongside the coupon
+results.
 
-**Data-layer capability:** `PlantDataLoader.ingest_sensor_snapshot()` ingests
-structured sensor readings directly into the RAG knowledge base so that
-subsequent natural-language queries can reason over measured time-series.
+**Data-layer capability:** `PlantDataLoader.ingest_sensor_snapshot()` stores
+periodic furnace-condition records in the RAG knowledge base so they can be
+co-queried with characterisation data.
 
 ```python
 from msr_kb_sources import PlantDataLoader
 
 loader = PlantDataLoader()
 
-# After each measurement cycle (e.g., every 4 h)
+# Call from the DAQ script every 4 h for the duration of each test
 loader.ingest_sensor_snapshot(rag, [
-    {"timestamp": "2025-03-01T04:00Z", "sensor": "loop_temperature_c",
-     "value": 698.4, "unit": "°C", "location": "hot-leg"},
-    {"timestamp": "2025-03-01T04:00Z", "sensor": "redox_potential_mv",
-     "value": -342.1, "unit": "mV", "electrode": "Pt/Ni"},
-    {"timestamp": "2025-03-01T04:00Z", "sensor": "corrosion_current_ua",
-     "value": 8.3, "unit": "µA", "coupon": "IN617-A"},
-], source_id="loop-run-007-2025-03-01T04Z")
+    {"timestamp": "2024-06-01T04:00Z",
+     "sensor": "furnace_temperature_c",   "value": 600.2, "unit": "°C",
+     "test_id": "FLiNaK-purified-3000h"},
+    {"timestamp": "2024-06-01T04:00Z",
+     "sensor": "ar_overpressure_bar",     "value": 0.302, "unit": "bar",
+     "test_id": "FLiNaK-purified-3000h"},
+    {"timestamp": "2024-06-01T04:00Z",
+     "sensor": "glovebox_o2_ppm",         "value": 7.1,   "unit": "ppm",
+     "test_id": "FLiNaK-purified-3000h"},
+], source_id="FLiNaK-purified-3000h-2024-06-01T04Z")
 ```
 
-Via the Lambda HTTP endpoint from a LabVIEW or Python DAQ script:
-
-```bash
-curl -X POST https://<api-gw>/prod/data/ingest \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content": "04:00 UTC — hot-leg 698.4°C, redox −342 mV, coupon IN617-A at 8.3 µA",
-    "data_type": "sensor_snapshot",
-    "source_id": "loop-run-007-2025-03-01T04Z"
-  }'
-```
-
-Once ingested, any future query such as *"When did the redox potential cross
-−350 mV and what was the simultaneous corrosion current?"* is answerable by
-the RAG pipeline without manual log-file searching.
+After 3 000 h a query like *"Were there any periods during the purified-FLiNaK
+3 000 h run where the glovebox O₂ exceeded 10 ppm, and what was the furnace
+temperature at those times?"* can be answered without manually scanning
+controller log files.
 
 ---
 
-### 4 — During Experiment: Shift-Log and Observation Ingestion
+### 4 — During Experiment: Ingesting Salt-Preparation and Purification Records
 
-**Experimental need:** In a long-duration loop test, shift technicians record
-qualitative observations that are critical for interpretation but difficult to
-query retrospectively: *"salt level in the pump bowl dropped 3 mm; likely
-micro-leak at the upper flange gasket"*, *"faint white deposit on the cold-leg
-viewing window"*.  These notes are typically kept in paper log books or flat
-text files and are rarely cross-referenced with sensor data.
+**Paper connection:** The key experimental variable is salt purity.  The
+Copenhagen Atomics purification method (high-temperature treatment under inert
+gas, resulting in moisture below detection and oxides &lt;10 ppm) is what
+separates the two coupon populations.  Documenting the purification batch
+record for every test tube is essential for traceability and for future
+statistical analysis of purity vs. corrosion depth.
 
-**Data-layer capability:** Free-text maintenance and event logs can be ingested
-alongside structured sensor data so that the RAG pipeline surfaces them in
-context.
+**Data-layer capability:** Free-text purification and preparation records are
+ingested as event logs so they are retrievable alongside the coupon results.
 
 ```python
 loader.ingest_text(
     rag,
     text=(
-        "Shift log 2025-03-15 06:00 UTC — Operator noted faint white "
-        "crystalline deposit on cold-leg observation window (location CL-4). "
-        "Loop temperature 690 °C. Salt level unchanged. Suspect UF4 "
-        "precipitation at cold-leg minimum temperature 585 °C.  "
-        "Salt sample drawn (SSC-007-015)."
+        "Salt batch CA-FLiNaK-P-007 (purified). "
+        "Composition: LiF 46.5 mol%, NaF 11.5 mol%, KF 42 mol%. "
+        "Purification: 24 h at 500 °C under Ar flow, followed by HF/H₂ sparging. "
+        "Post-purification assay: moisture below detection limit (<1 ppm), "
+        "oxide impurities 6 ppm (ICP-OES). "
+        "Loaded into test tube T-P-07 on 2024-05-15; "
+        "four 316L coupons (IDs: P07-A, P07-B, P07-C, P07-D) suspended. "
+        "Test start: 2024-05-15T10:00Z. Target exposure: 3000 h at 600 °C."
     ),
-    source_id="shift-log-20250315T0600Z",
-    data_type="event_log",
+    source_id="salt-batch-CA-FLiNaK-P-007",
+    data_type="salt_preparation_record",
 )
 ```
 
-A subsequent RAG query such as *"List all instances of solid precipitation
-observed in the cold leg and the associated temperature at the time"* will
-surface this entry alongside any matching historical ORNL observations.
+This links a coupon ID to a specific salt batch, enabling a future query like
+*"Which coupons came from salt batches with oxide impurities above 8 ppm, and
+what were their corrosion depths?"*
 
 ---
 
-### 5 — Post-Experiment: Coupon Characterisation Data Storage
+### 5 — After Each Time-Point: Storing ICP-OES Results
 
-**Experimental need:** After loop teardown, post-irradiation examination (PIE)
-or post-exposure characterisation generates structured results: SEM/EDS
-elemental profiles, mass-loss measurements, XRD phase identification, tensile
-test curves.  These results need to be stored in a form that supports
-cross-experiment comparison.
+**Paper connection:** Post-test salt samples were dissolved in nitric/
+hydrochloric acid and analysed by ICP-OES for **Cr, Fe, and Ni**.  The paper
+reports average concentrations across the three exposure durations (Table in
+Section 4.3):
 
-**Data-layer capability:** Characterisation reports are ingested as structured
-documents with equipment-tagged `source_id` values following the convention
-`<experiment-id>/<coupon-id>/<technique>`.
+| Metal | Untreated (mg/kg) | Purified (mg/kg) |
+|---|---|---|
+| Cr | 1 200 ± 100 | 110 ± 6 |
+| Fe | 800 ± 300  | 22 ± 7  |
+| Ni | 80 ± 32    | below detection |
+
+**Data-layer capability:** Each ICP-OES result set is ingested as a structured
+characterisation record so it can be queried alongside corrosion-depth and
+mass-change data.
 
 ```python
 loader.ingest_text(
     rag,
     text=(
-        "Post-exposure SEM/EDS of coupon IN617-A (loop-run-007, 1000 h at "
-        "700 °C in FLiBe-UF4 with U/U4+ = 0.01). Cr depletion zone: "
-        "42 ± 3 µm. Mo enrichment at grain boundaries observed to 8 at%. "
-        "Mass loss: 1.34 mg/cm². No evidence of intergranular attack. "
-        "Phase ID by XRD: gamma-Ni matrix + CrF2 surface film."
+        "ICP-OES salt analysis — test tube T-U-03 (untreated FLiNaK, 1000 h, 600 °C). "
+        "Dissolved metals: Cr 1185 mg/kg, Fe 510 mg/kg, Ni 48 mg/kg. "
+        "Analysis date: 2024-07-20. Lab: Copenhagen Atomics internal. "
+        "Coupons: U03-A, U03-B, U03-C, U03-D."
     ),
-    source_id="loop-run-007/IN617-A/SEM-EDS",
+    source_id="icp-oes/T-U-03/1000h",
     data_type="characterisation_report",
 )
 ```
 
-After ingesting results from multiple coupons and multiple runs, a query such
-as *"How does the chromium depletion depth in IN617 vary with U/U4+ ratio
-across all loop runs?"* synthesises the stored characterisation records into a
-comparison table.
+After all 18 tests are ingested, a single RAG query surfaces the full Cr/Fe/Ni
+dissolution trend across the purified vs. untreated series and all three
+time-points — the same analysis the paper presents in Section 4.3, but
+queryable in plain language.
 
 ---
 
-### 6 — Post-Experiment: AI-Assisted Interpretation via MCP Tools
+### 6 — After Each Time-Point: Storing Mass-Change and Corrosion-Depth Records
 
-**Experimental need:** Once sensor time-series, shift logs, and characterisation
-data are all in the knowledge base, the experimentalist needs to query across
-all of them simultaneously — correlating redox-probe readings with observed
-corrosion rates, identifying the onset time of accelerated attack, and
-contextualising the results against ORNL historical benchmarks.
+**Paper connection:** The paper reports coupon mass change (untreated salt
+~194× greater loss than purified) and SEM-measured corrosion depths (untreated
+68.5 → 112.1 µm vs. purified 2.1 → 3.0 µm over 1 000–3 000 h), with
+ImageJ used for depth measurements on cross-sectional SEM images.
 
-**Data-layer capability:** The seven MCP tools are the primary interface for
-AI-agent-assisted interpretation.  An LLM agent connected via the Model Context
-Protocol can call these tools in sequence to synthesise a complete picture:
+**Data-layer capability:** Mass and depth records are ingested per coupon per
+time-point with a consistent `source_id` scheme enabling cross-series
+comparisons.
 
-```
-Agent workflow for post-experiment interpretation:
+```python
+# Mass-change record after the 1000 h untreated-FLiNaK test teardown
+loader.ingest_text(
+    rag,
+    text=(
+        "Mass change — coupon U03-A (untreated FLiNaK, 1000 h, 600 °C). "
+        "Pre-exposure mass: 14.823 g. Post-exposure mass: 14.695 g. "
+        "Mass loss: 128 mg. Coupon area: 13.24 cm². "
+        "Specific mass loss: 9.67 mg/cm²."
+    ),
+    source_id="mass-change/T-U-03/U03-A/1000h",
+    data_type="characterisation_report",
+)
 
-1. get_all_sensor_readings      → confirm current loop status / end-of-run state
-2. get_active_alarms            → check for any threshold violations in sensor history
-3. rag.answer(question)         → query across archive + papers + ingested experiment data
-4. ingest_plant_data            → store the agent's synthesised interpretation report
-```
-
-Example Claude/Copilot prompt, with MCP tools active:
-
-```
-Using the MSR data layer tools:
-1. Search the knowledge base for all corrosion-rate measurements on IN617
-   in FLiBe-UF4 between 650 °C and 720 °C.
-2. Retrieve the sensor history for the redox_potential_mv sensor from
-   loop-run-007.
-3. Correlate the redox excursions above −300 mV with the peak corrosion
-   current events and compare against the ORNL MSRE baseline.
-4. Store a summary of this analysis in the knowledge base for future reference.
+# SEM corrosion depth from ImageJ measurement
+loader.ingest_text(
+    rag,
+    text=(
+        "SEM cross-section — coupon U03-A (untreated FLiNaK, 1000 h, 600 °C). "
+        "Intergranular corrosion observed. Maximum corrosion depth (ImageJ): 71 µm. "
+        "Mean corrosion depth: 68.5 µm. "
+        "Attack mode: intergranular; no uniform dissolution. "
+        "Cr-depleted zone confirmed by EDS line scan."
+    ),
+    source_id="sem/T-U-03/U03-A/1000h",
+    data_type="characterisation_report",
+)
 ```
 
 ---
 
-### 7 — Data Governance: Reproducible Experimental Record
+### 7 — Post-Exposure: Storing GIXRD Phase-Identification Results
 
-**Experimental need:** A peer-reviewed experimental paper requires a
-reproducible data record — every ingested document must be traceable to an
-exact source, and the knowledge base state at the time of the paper's analysis
-must be reconstructable.
+**Paper connection:** GIXRD identified key phases that explain the mechanistic
+difference between purified and untreated salts:
 
-**Data-layer capability:** The state-tracking files (`archive_state.json`,
-`openalex_state.json`, `plant_data_state.json`) record the exact URL or ID of
-every ingested document.  Committing the `kb_store/` state files alongside the
-paper's supplementary data provides a complete provenance record.
+* **Purified FLiNaK coupons:** Cr₇C₃ and Cr₂₃C₆ (chromium carbides) —
+  hypothesised to act as diffusion barriers.
+* **Untreated FLiNaK coupons:** FeCr₂O₄ spinel, KF/K-Cr-F compounds, and
+  γ-Fe → α-Fe transformation (austenite to ferrite) from Cr and Ni depletion.
 
-```bash
-# Show exactly what is in the knowledge base
-python msr_kb_sources.py --status
+**Data-layer capability:** Phase-identification results are ingested as
+structured text, linking phase names to the coupon, salt condition, and
+exposure duration, so that future queries can reason over mechanism.
 
-# Example output:
-# msr-archive:  127 files ingested
-# openalex:      84 papers ingested
-# plant-data:   312 records ingested
+```python
+loader.ingest_text(
+    rag,
+    text=(
+        "GIXRD phase identification — coupon P07-B (purified FLiNaK, 3000 h, 600 °C). "
+        "Phases detected: Cr₇C₃ (chromium carbide), Cr₂₃C₆ (chromium carbide), "
+        "γ-Fe (austenite, matrix retained). "
+        "No FeCr₂O₄ detected. No KF or K-Cr-F compounds. "
+        "Interpretation: Cr carbide surface film may act as diffusion barrier "
+        "limiting further Cr dissolution into the salt."
+    ),
+    source_id="gixrd/T-P-07/P07-B/3000h",
+    data_type="characterisation_report",
+)
+
+loader.ingest_text(
+    rag,
+    text=(
+        "GIXRD phase identification — coupon U03-C (untreated FLiNaK, 3000 h, 600 °C). "
+        "Phases detected: FeCr₂O₄ (spinel), KF, K-Cr-F compounds, α-Fe (ferrite). "
+        "Original γ-Fe austenite peak greatly reduced — consistent with "
+        "Cr and Ni depletion driving γ-to-α transformation. "
+        "Interpretation: impurity-driven oxide dissolution removes passive Cr₂O₃ "
+        "layer, exposing alloy to further fluoride attack."
+    ),
+    source_id="gixrd/T-U-03/U03-C/3000h",
+    data_type="characterisation_report",
+)
 ```
 
-> **Caveat (Rickover):** State-file provenance records *which URLs were fetched*
-> but not *what those URLs returned at the time of fetch*.  For archival
-> reproducibility, snapshots of the raw OCR text and paper abstracts should be
-> committed to a version-controlled supplementary data repository.
+Once all GIXRD records are ingested, a query like *"Which coupons retained
+austenite after 3 000 h and what were their corresponding salt-Cr concentrations?"*
+draws on both the GIXRD records and the ICP-OES records in one answer.
 
 ---
 
-### Summary: Experimental Workflow × Data-Layer Capability Matrix
+### 8 — Cross-Experiment Analysis: Querying the Full 18-Test Dataset
 
-| Experimental phase | Data-layer capability | Key API / CLI |
+**Paper connection:** The paper's main finding is the ~33× difference in
+corrosion depth and ~194× difference in mass loss between untreated and
+purified salt, and the saturation of corrosion depth in untreated salt between
+2 000 and 3 000 h.  This is derived by cross-referencing results from all 18
+tests.
+
+**Data-layer capability:** Once all ICP-OES, mass-change, SEM, and GIXRD
+records are ingested, the RAG pipeline can synthesise cross-test comparisons in
+plain language.
+
+```python
+answer = rag.answer(
+    "Summarise the chromium depletion depth and dissolved Cr concentration "
+    "in the salt for all 316L SS coupons tested in FLiNaK, grouped by "
+    "salt condition (purified vs. untreated) and exposure time. "
+    "Does the untreated-salt corrosion depth appear to plateau after 2000 h?"
+)
+print(answer)
+```
+
+```python
+answer = rag.answer(
+    "Compare the GIXRD phases found in purified vs. untreated FLiNaK coupons. "
+    "Which phases are unique to untreated-salt coupons and which are unique "
+    "to purified-salt coupons? What mechanistic interpretation does this support?"
+)
+```
+
+This supports the paper's Discussion section — and also supports future
+researchers replicating or extending the work, who need to understand whether
+new data points are consistent with the existing dataset.
+
+---
+
+### 9 — Future Work: Contextualising UF₃/UF₄ and Fission-Product Extensions
+
+**Paper connection:** Section 6 (Conclusion) explicitly lists four directions
+for future work: radiation effects, fission-product chemistry, **UF₃/UF₄
+additions**, and temperature/flow gradients.  These represent the next
+experimental programme.
+
+**Data-layer capability:** The same data layer serves as the foundation for the
+follow-on programme.  ORNL archive reports on uranium-bearing salts (MSRE ran
+with UF₄ dissolved in FLiBe) and OpenAlex papers on fission-product speciation
+are already in the knowledge base.
+
+```python
+# Before designing the UF4-doped FLiNaK tests:
+answer = rag.answer(
+    "What effect did UF4 additions have on the corrosion rate of structural "
+    "alloys in the MSRE? What U/U4+ redox ratio was maintained, and how was "
+    "it controlled? Were there 316 SS or stainless steel tests in uranium-bearing salts?"
+)
+
+answer = rag.answer(
+    "What tellurium and cesium speciation data exists for FLiNaK at 600 °C "
+    "in the ORNL reports? How were fission-product impurities handled "
+    "during the MSRE purification cycles?"
+)
+```
+
+This gives the Copenhagen Atomics team a head-start on experimental design for
+the follow-on UF₄ and fission-product tests — grounded in six decades of ORNL
+operational data — before a single new test begins.
+
+---
+
+### Summary: Lucas et al. (2025) Experimental Workflow × Data-Layer Capability
+
+| Experimental step (paper section) | Data ingested | Data-layer capability |
 |---|---|---|
-| Pre-experiment: ORNL context | RAG over msr-archive OCR | `rag.load_msr_archive()` |
-| Pre-experiment: literature survey | RAG over OpenAlex papers | `python msr_kb_sources.py --update-openalex` |
-| During: sensor time-series | `ingest_sensor_snapshot()` | `POST /data/ingest` |
-| During: shift-log observations | `ingest_text()` | `POST /data/ingest` |
-| Post: characterisation reports | `ingest_text()` with tagged `source_id` | `PlantDataLoader` |
-| Post: cross-experiment query | RAG `answer()` over full KB | `rag.answer(question)` |
-| Post: AI-agent interpretation | MCP tools (read + ingest) | `get_sensor_history`, `get_active_alarms` |
-| Publication: provenance | State-file snapshot | `python msr_kb_sources.py --status` |
+| Design — ORNL baseline (§1 Intro) | ORNL MSRE/MSBR reports | `rag.load_msr_archive()` |
+| Design — recent literature (§1 Intro) | OpenAlex 316L/FLiNaK papers | `python msr_kb_sources.py --update-openalex` |
+| During — furnace conditions (§2.1) | Temp, Ar pressure, glovebox O₂ per test | `loader.ingest_sensor_snapshot()` |
+| During — salt prep records (§2.1) | Batch IDs, purity assay, impurity levels | `loader.ingest_text()` (salt_preparation_record) |
+| Post-test — ICP-OES (§4.3) | Dissolved Cr/Fe/Ni per test tube per time-point | `loader.ingest_text()` (characterisation_report) |
+| Post-test — mass change (§4.5) | Pre/post mass, specific mass loss per coupon | `loader.ingest_text()` (characterisation_report) |
+| Post-test — SEM depth (§4.4) | Max and mean corrosion depth, attack mode | `loader.ingest_text()` (characterisation_report) |
+| Post-test — GIXRD phases (§4.6) | Phase names, mechanistic interpretation | `loader.ingest_text()` (characterisation_report) |
+| Analysis — cross-test comparison (§5) | Full 18-test dataset | `rag.answer()` |
+| Future work — UF₄ / fission products (§6) | ORNL uranium-salt + fission-product data | `rag.answer()` over existing archive |
 
 ---
 
