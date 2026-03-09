@@ -1171,6 +1171,285 @@ with the instruction to return when it had actually been built and run.
 
 ---
 
+## Supporting MSR Experimental Work: J. Nucl. Mater. (2025) Mapping
+
+> **Article reference:** *Journal of Nuclear Materials*, 2025,
+> doi:10.1016/j.jnucmat.2025.155737 (PII S0022311525007913)
+>
+> The Journal of Nuclear Materials (ISSN 0022-3115) publishes experimental
+> materials-science work directly relevant to molten salt reactor development:
+> corrosion of structural alloys in fluoride/chloride salts, fission-product
+> speciation and transport, thermophysical property measurements of fuel and
+> coolant salts, redox-potential electrochemistry, and radiation-effects
+> characterisation.  The sections below map each major experimental workflow
+> phase to a specific data-layer capability.
+
+---
+
+### 1 — Pre-Experiment: Historical Context from ORNL Reports
+
+**Experimental need:** Before designing a new corrosion coupon experiment or
+salt-chemistry study, researchers must survey prior ORNL results — loop
+corrosion data from the 1960s–70s MSRE/MSBR programmes, tellurium
+embrittlement studies, fission-product volatility measurements — to avoid
+re-discovering known failure modes and to set realistic baseline values.
+
+**Data-layer capability:** The RAG pipeline pre-loads OCR transcripts from the
+`pranavkantgaur/msr-archive` GitHub repository, which contains the primary
+ORNL MSR technical reports.
+
+```python
+from msr_digital_twin_with_rag import MSRDigitalTwinRAG
+
+rag = MSRDigitalTwinRAG()
+rag.load_msr_archive()   # one-time ingest; re-run adds only new files
+
+# Query historical corrosion measurements
+answer = rag.answer(
+    "What corrosion rates were measured for Hastelloy N coupons in "
+    "FLiBe-UF4 at 650–700 °C during MSRE loop tests?"
+)
+print(answer)
+```
+
+```bash
+# CLI equivalent
+python msr_digital_twin_with_rag.py \
+  "Summarise ORNL fission-product volatility data for tellurium in FLiBe"
+```
+
+This surfaces specific ORNL report numbers, measured values, and experimental
+conditions — giving the experimentalist a traceable prior-art baseline in
+seconds rather than hours of manual literature search.
+
+---
+
+### 2 — Pre-Experiment: Recent Literature Survey via OpenAlex
+
+**Experimental need:** Knowing the current state of the art — which alloy
+compositions have been tested in FLiNaK since 2010, what redox-control
+strategies have been validated at bench scale — helps the researcher calibrate
+measurement uncertainty and choose appropriate control conditions.
+
+**Data-layer capability:** The OpenAlex loader queries the academic paper API
+for MSR-relevant experimental papers and ingests their abstracts into the
+knowledge base alongside the ORNL archive.
+
+```bash
+# Pull all new MSR experimental papers from OpenAlex
+python msr_kb_sources.py --update-openalex
+```
+
+```python
+# After update, query spans both ORNL reports and recent literature
+answer = rag.answer(
+    "What chromium depletion depths have been reported for 316L SS "
+    "after 500 h immersion in FLiBe at 700 °C?"
+)
+```
+
+Because both the ORNL archive and OpenAlex papers live in the same vector
+store, a single query retrieves corroborating or contradicting evidence from
+six decades of published experimental work.
+
+---
+
+### 3 — During Experiment: Continuous Sensor Data Ingestion
+
+**Experimental need:** A molten-salt loop experiment typically runs continuously
+for hundreds to thousands of hours, generating time-series data from multiple
+sensors: furnace temperature controllers, thermal mass-flow meters, in-line
+redox probes (Pt/Ni reference electrodes), pressure transducers, and
+occasionally online gamma spectrometers tracking noble-metal fission products.
+This data must be stored in a queryable form alongside the experimental
+narrative.
+
+**Data-layer capability:** `PlantDataLoader.ingest_sensor_snapshot()` ingests
+structured sensor readings directly into the RAG knowledge base so that
+subsequent natural-language queries can reason over measured time-series.
+
+```python
+from msr_kb_sources import PlantDataLoader
+
+loader = PlantDataLoader()
+
+# After each measurement cycle (e.g., every 4 h)
+loader.ingest_sensor_snapshot(rag, [
+    {"timestamp": "2025-03-01T04:00Z", "sensor": "loop_temperature_c",
+     "value": 698.4, "unit": "°C", "location": "hot-leg"},
+    {"timestamp": "2025-03-01T04:00Z", "sensor": "redox_potential_mv",
+     "value": -342.1, "unit": "mV", "electrode": "Pt/Ni"},
+    {"timestamp": "2025-03-01T04:00Z", "sensor": "corrosion_current_ua",
+     "value": 8.3, "unit": "µA", "coupon": "IN617-A"},
+], source_id="loop-run-007-2025-03-01T04Z")
+```
+
+Via the Lambda HTTP endpoint from a LabVIEW or Python DAQ script:
+
+```bash
+curl -X POST https://<api-gw>/prod/data/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "04:00 UTC — hot-leg 698.4°C, redox −342 mV, coupon IN617-A at 8.3 µA",
+    "data_type": "sensor_snapshot",
+    "source_id": "loop-run-007-2025-03-01T04Z"
+  }'
+```
+
+Once ingested, any future query such as *"When did the redox potential cross
+−350 mV and what was the simultaneous corrosion current?"* is answerable by
+the RAG pipeline without manual log-file searching.
+
+---
+
+### 4 — During Experiment: Shift-Log and Observation Ingestion
+
+**Experimental need:** In a long-duration loop test, shift technicians record
+qualitative observations that are critical for interpretation but difficult to
+query retrospectively: *"salt level in the pump bowl dropped 3 mm; likely
+micro-leak at the upper flange gasket"*, *"faint white deposit on the cold-leg
+viewing window"*.  These notes are typically kept in paper log books or flat
+text files and are rarely cross-referenced with sensor data.
+
+**Data-layer capability:** Free-text maintenance and event logs can be ingested
+alongside structured sensor data so that the RAG pipeline surfaces them in
+context.
+
+```python
+loader.ingest_text(
+    rag,
+    text=(
+        "Shift log 2025-03-15 06:00 UTC — Operator noted faint white "
+        "crystalline deposit on cold-leg observation window (location CL-4). "
+        "Loop temperature 690 °C. Salt level unchanged. Suspect UF4 "
+        "precipitation at cold-leg minimum temperature 585 °C.  "
+        "Salt sample drawn (SSC-007-015)."
+    ),
+    source_id="shift-log-20250315T0600Z",
+    data_type="event_log",
+)
+```
+
+A subsequent RAG query such as *"List all instances of solid precipitation
+observed in the cold leg and the associated temperature at the time"* will
+surface this entry alongside any matching historical ORNL observations.
+
+---
+
+### 5 — Post-Experiment: Coupon Characterisation Data Storage
+
+**Experimental need:** After loop teardown, post-irradiation examination (PIE)
+or post-exposure characterisation generates structured results: SEM/EDS
+elemental profiles, mass-loss measurements, XRD phase identification, tensile
+test curves.  These results need to be stored in a form that supports
+cross-experiment comparison.
+
+**Data-layer capability:** Characterisation reports are ingested as structured
+documents with equipment-tagged `source_id` values following the convention
+`<experiment-id>/<coupon-id>/<technique>`.
+
+```python
+loader.ingest_text(
+    rag,
+    text=(
+        "Post-exposure SEM/EDS of coupon IN617-A (loop-run-007, 1000 h at "
+        "700 °C in FLiBe-UF4 with U/U4+ = 0.01). Cr depletion zone: "
+        "42 ± 3 µm. Mo enrichment at grain boundaries observed to 8 at%. "
+        "Mass loss: 1.34 mg/cm². No evidence of intergranular attack. "
+        "Phase ID by XRD: gamma-Ni matrix + CrF2 surface film."
+    ),
+    source_id="loop-run-007/IN617-A/SEM-EDS",
+    data_type="characterisation_report",
+)
+```
+
+After ingesting results from multiple coupons and multiple runs, a query such
+as *"How does the chromium depletion depth in IN617 vary with U/U4+ ratio
+across all loop runs?"* synthesises the stored characterisation records into a
+comparison table.
+
+---
+
+### 6 — Post-Experiment: AI-Assisted Interpretation via MCP Tools
+
+**Experimental need:** Once sensor time-series, shift logs, and characterisation
+data are all in the knowledge base, the experimentalist needs to query across
+all of them simultaneously — correlating redox-probe readings with observed
+corrosion rates, identifying the onset time of accelerated attack, and
+contextualising the results against ORNL historical benchmarks.
+
+**Data-layer capability:** The seven MCP tools are the primary interface for
+AI-agent-assisted interpretation.  An LLM agent connected via the Model Context
+Protocol can call these tools in sequence to synthesise a complete picture:
+
+```
+Agent workflow for post-experiment interpretation:
+
+1. get_all_sensor_readings      → confirm current loop status / end-of-run state
+2. get_active_alarms            → check for any threshold violations in sensor history
+3. rag.answer(question)         → query across archive + papers + ingested experiment data
+4. ingest_plant_data            → store the agent's synthesised interpretation report
+```
+
+Example Claude/Copilot prompt, with MCP tools active:
+
+```
+Using the MSR data layer tools:
+1. Search the knowledge base for all corrosion-rate measurements on IN617
+   in FLiBe-UF4 between 650 °C and 720 °C.
+2. Retrieve the sensor history for the redox_potential_mv sensor from
+   loop-run-007.
+3. Correlate the redox excursions above −300 mV with the peak corrosion
+   current events and compare against the ORNL MSRE baseline.
+4. Store a summary of this analysis in the knowledge base for future reference.
+```
+
+---
+
+### 7 — Data Governance: Reproducible Experimental Record
+
+**Experimental need:** A peer-reviewed experimental paper requires a
+reproducible data record — every ingested document must be traceable to an
+exact source, and the knowledge base state at the time of the paper's analysis
+must be reconstructable.
+
+**Data-layer capability:** The state-tracking files (`archive_state.json`,
+`openalex_state.json`, `plant_data_state.json`) record the exact URL or ID of
+every ingested document.  Committing the `kb_store/` state files alongside the
+paper's supplementary data provides a complete provenance record.
+
+```bash
+# Show exactly what is in the knowledge base
+python msr_kb_sources.py --status
+
+# Example output:
+# msr-archive:  127 files ingested
+# openalex:      84 papers ingested
+# plant-data:   312 records ingested
+```
+
+> **Caveat (Rickover):** State-file provenance records *which URLs were fetched*
+> but not *what those URLs returned at the time of fetch*.  For archival
+> reproducibility, snapshots of the raw OCR text and paper abstracts should be
+> committed to a version-controlled supplementary data repository.
+
+---
+
+### Summary: Experimental Workflow × Data-Layer Capability Matrix
+
+| Experimental phase | Data-layer capability | Key API / CLI |
+|---|---|---|
+| Pre-experiment: ORNL context | RAG over msr-archive OCR | `rag.load_msr_archive()` |
+| Pre-experiment: literature survey | RAG over OpenAlex papers | `python msr_kb_sources.py --update-openalex` |
+| During: sensor time-series | `ingest_sensor_snapshot()` | `POST /data/ingest` |
+| During: shift-log observations | `ingest_text()` | `POST /data/ingest` |
+| Post: characterisation reports | `ingest_text()` with tagged `source_id` | `PlantDataLoader` |
+| Post: cross-experiment query | RAG `answer()` over full KB | `rag.answer(question)` |
+| Post: AI-agent interpretation | MCP tools (read + ingest) | `get_sensor_history`, `get_active_alarms` |
+| Publication: provenance | State-file snapshot | `python msr_kb_sources.py --status` |
+
+---
+
 ## Documentation
 
 * [00_MCP_START_HERE.md](00_MCP_START_HERE.md) – five-minute quick start
