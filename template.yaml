@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  MSR Knowledge Base Service
+
+  Deploys the MSR digital twin MCP server and RAG knowledge base as a
+  serverless HTTPS service on AWS Lambda.  Exposes four HTTP endpoints:
+
+    GET  /health      – liveness check
+    POST /mcp         – MCP JSON-RPC 2.0 (for MCP-compatible agents)
+    POST /query       – simple plain-text RAG query
+    POST /kb/update   – trigger KB ingestion (archive + OpenAlex)
+
+  A separate EventBridge rule runs the KB updater on a daily schedule.
+
+# ---------------------------------------------------------------------------
+# SAM/CloudFormation Parameters
+# ---------------------------------------------------------------------------
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment name (used in resource names/tags).
+
+  OpenAIApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      OpenAI API key for LLM + embeddings.  Leave blank to use the
+      random-projection embedding engine (no LLM synthesis).
+
+  MsrApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Shared API key for request authentication (X-Api-Key header).
+      Leave blank to disable authentication (not recommended for production).
+
+  OpenAlexEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Email address for the OpenAlex polite-pool header.  Increases rate
+      limits.  Leave blank to omit the header.
+
+  GithubToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      GitHub personal access token for the msr-archive fetcher.  Increases
+      the API rate limit from 60 to 5 000 requests/hr.  Optional.
+
+  OpenAlexMaxResults:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+    Description: Maximum number of OpenAlex papers ingested per scheduled run.
+
+  KBUpdateSchedule:
+    Type: String
+    Default: "rate(1 day)"
+    Description: >
+      EventBridge schedule expression for periodic KB updates.
+      Examples: "rate(1 day)", "cron(0 2 * * ? *)" (daily at 02:00 UTC).
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      # x86_64: numpy binaries require a matching architecture.
+      # Switch to arm64 only if building on Graviton (requires separate sam build).
+      - x86_64
+    MemorySize: 1024    # 1 GB – numpy dense embedding matrix benefits from RAM
+    Timeout: 900        # 15 minutes – max Lambda timeout (for initial KB load)
+    Tracing: Active     # AWS X-Ray
+    Layers:
+      []                # Add Lambda layers here if needed (e.g. custom numpy)
+    Environment:
+      Variables:
+        MSR_KB_DIR: /tmp/kb_store
+        MSR_DOCS_DIR: /tmp/docs
+        MSR_KB_S3_BUCKET: !Ref KBStoreBucket
+        MSR_KB_S3_PREFIX: !Sub "kb-${Environment}/"
+        MSR_OPENAI_API_KEY: !Ref OpenAIApiKey
+        MSR_API_KEY: !Ref MsrApiKey
+        MSR_OPENALEX_EMAIL: !Ref OpenAlexEmail
+        MSR_GITHUB_TOKEN: !Ref GithubToken
+        MSR_OPENALEX_MAX_RESULTS: !Ref OpenAlexMaxResults
+        POWERTOOLS_SERVICE_NAME: msr-kb-service
+        LOG_LEVEL: INFO
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+
+Resources:
+
+  # -----------------------------------------------------------------------
+  # S3 bucket – persistent KB storage
+  # -----------------------------------------------------------------------
+
+  KBStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "msr-kb-store-${AWS::AccountId}-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled       # keeps previous KB snapshots
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: msr-data-layer
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -----------------------------------------------------------------------
+  # HTTP API Gateway
+  # -----------------------------------------------------------------------
+
+  MSRHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      Description: MSR Knowledge Base Service API
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - X-Api-Key
+          - Authorization
+        MaxAge: 300
+      Tags:
+        Project: msr-data-layer
+        Environment: !Ref Environment
+
+  # -----------------------------------------------------------------------
+  # Main Lambda function – serves HTTP requests
+  # -----------------------------------------------------------------------
+
+  MSRKBFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "msr-kb-service-${Environment}"
+      Description: MSR Knowledge Base Service (MCP + RAG query + KB update)
+      CodeUri: .
+      Handler: lambda_function.lambda_handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref KBStoreBucket
+        - CloudWatchLogsFullAccess
+      Events:
+        # ── HTTP routes ──────────────────────────────────────────────────
+        HealthCheck:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /health
+            Method: GET
+        MCPEndpoint:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /mcp
+            Method: POST
+        QueryEndpoint:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /query
+            Method: POST
+        KBUpdateEndpoint:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /kb/update
+            Method: POST
+        # ── Scheduled KB refresh (EventBridge) ──────────────────────────
+        ScheduledKBUpdate:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref KBUpdateSchedule
+            Name: !Sub "msr-kb-daily-update-${Environment}"
+            Description: Periodic KB refresh from msr-archive and OpenAlex
+            Enabled: true
+            Input: |
+              {
+                "source": "aws.events",
+                "detail-type": "Scheduled Event",
+                "detail": "periodic-kb-update"
+              }
+      Tags:
+        Project: msr-data-layer
+        Environment: !Ref Environment
+
+  # -----------------------------------------------------------------------
+  # CloudWatch Log Group (explicit so retention is set)
+  # -----------------------------------------------------------------------
+
+  MSRKBFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/msr-kb-service-${Environment}"
+      RetentionInDays: 30
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL for the MSR Knowledge Base Service
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "msr-kb-api-url-${Environment}"
+
+  HealthEndpoint:
+    Description: Health-check URL
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/health"
+
+  MCPEndpoint:
+    Description: MCP JSON-RPC 2.0 endpoint
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/mcp"
+
+  QueryEndpoint:
+    Description: Plain-text RAG query endpoint
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/query"
+
+  KBUpdateEndpoint:
+    Description: Knowledge-base update endpoint
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/kb/update"
+
+  KBStoreBucketName:
+    Description: S3 bucket storing the persistent knowledge base
+    Value: !Ref KBStoreBucket
+    Export:
+      Name: !Sub "msr-kb-bucket-${Environment}"
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt MSRKBFunction.Arn

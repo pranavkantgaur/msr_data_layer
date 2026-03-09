@@ -23,13 +23,18 @@ parallel-search approach.
 | `msr_digital_twin_client.py` | Python client for the MCP server |
 | `msr_digital_twin_with_rag.py` | Enhanced multi-step RAG pipeline |
 | `msr_kb_sources.py` | KB source loaders: msr-archive (static) + OpenAlex (dynamic) |
-| `requirements_mcp.txt` | Python dependencies |
+| `lambda_function.py` | AWS Lambda handler (HTTP API + EventBridge scheduler) |
+| `template.yaml` | AWS SAM template (Lambda + API Gateway + S3) |
+| `Makefile` | Build / deploy / local-dev convenience targets |
+| `requirements_mcp.txt` | Core Python dependencies |
+| `requirements_lambda.txt` | Lambda-specific dependencies (adds boto3) |
 | `00_MCP_START_HERE.md` | Quick-start guide |
 | `MSR_DIGITAL_TWIN_MCP_GUIDE.md` | Full architecture and tool reference |
 | `MSR_MCP_DEPLOYMENT_GUIDE.md` | Deployment and production guide |
 | `test_msr_mcp_server.py` | Unit tests for MCP server |
 | `test_msr_rag.py` | Unit tests for enhanced RAG pipeline |
 | `test_msr_kb_sources.py` | Unit tests for KB source loaders |
+| `test_lambda_function.py` | Unit tests for Lambda handler |
 
 ---
 
@@ -187,6 +192,124 @@ Re-running the updater only adds truly new content.
 
 ---
 
+## AWS Lambda Deployment (`lambda_function.py` + `template.yaml`)
+
+The MSR knowledge base can be hosted as a **serverless HTTPS service on AWS
+Lambda**, making it accessible to any agent or tool over the internet.
+
+### Architecture
+
+```
+Agent / MCP client
+       │  HTTPS
+       ▼
+Amazon API Gateway (HTTP API)
+       │
+       ▼
+AWS Lambda  ─── GET  /health
+(lambda_function.py)
+               ├── POST /mcp        MCP JSON-RPC 2.0 (any MCP client)
+               ├── POST /query      Plain-text RAG query
+               └── POST /kb/update  Trigger KB ingestion
+
+S3 Bucket  ←─── KB persistence (chunks + embeddings + state)
+      ↑
+EventBridge (daily schedule)
+```
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/health` | GET | Liveness check – returns reactor status and service version |
+| `/mcp` | POST | Full MCP JSON-RPC 2.0 – for Claude Desktop, VS Code Copilot, custom agents |
+| `/query` | POST | Plain-text question → RAG answer (no MCP client needed) |
+| `/kb/update` | POST | Trigger ingestion from msr-archive / OpenAlex |
+
+### Prerequisites
+
+```bash
+pip install aws-sam-cli    # https://docs.aws.amazon.com/serverless-application-model/
+aws configure              # set AWS credentials
+```
+
+### Build and deploy
+
+```bash
+# First-time deploy (interactive – saves config to samconfig.toml)
+make deploy-guided
+
+# Subsequent deploys
+make deploy
+
+# Full help
+make help
+```
+
+### Local development
+
+```bash
+make local-api             # start local server at http://127.0.0.1:3000
+make local-health          # GET  /health
+make local-query           # POST /query  (test question)
+make local-mcp             # POST /mcp    (tools/list)
+make local-update          # POST /kb/update (first 5 archive files)
+```
+
+### Querying the deployed service
+
+```bash
+# Health check
+curl https://<api-id>.execute-api.us-east-1.amazonaws.com/prod/health
+
+# RAG query (plain text)
+curl -X POST \
+     -H "Content-Type: application/json" \
+     -H "X-Api-Key: $MSR_API_KEY" \
+     -d '{"question": "What is the thermal efficiency of the TMSR-LF1 reactor?"}' \
+     https://<api-id>.execute-api.us-east-1.amazonaws.com/prod/query
+
+# MCP tools/list (for MCP-compatible clients)
+curl -X POST \
+     -H "Content-Type: application/json" \
+     -H "X-Api-Key: $MSR_API_KEY" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+     https://<api-id>.execute-api.us-east-1.amazonaws.com/prod/mcp
+
+# Trigger KB update from both sources
+curl -X POST \
+     -H "Content-Type: application/json" \
+     -H "X-Api-Key: $MSR_API_KEY" \
+     -d '{"source": "all"}' \
+     https://<api-id>.execute-api.us-east-1.amazonaws.com/prod/kb/update
+```
+
+### Knowledge base persistence
+
+The Lambda function stores the KB files in `/tmp/kb_store` during execution
+and syncs them to an **S3 bucket** on each update so they survive across
+cold starts.  The SAM template creates the bucket automatically.
+
+### Scheduled KB refresh
+
+The same Lambda is also triggered daily by an **EventBridge rule** to
+automatically ingest new documents from both sources (configurable via the
+`KBUpdateSchedule` CloudFormation parameter, e.g. `rate(1 day)` or
+`cron(0 2 * * ? *)`).
+
+### Lambda-specific environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MSR_KB_S3_BUCKET` | (created by SAM) | S3 bucket for KB persistence |
+| `MSR_KB_S3_PREFIX` | `kb-prod/` | Key prefix inside the bucket |
+| `MSR_API_KEY` | _(unset)_ | Shared API key (X-Api-Key header) |
+
+All [existing env vars](#environment-variables) (`MSR_OPENAI_API_KEY`, etc.)
+are passed through via the SAM template parameters.
+
+---
+
 ## Available MCP Tools
 
 | Tool | Description |
@@ -232,7 +355,7 @@ msr_digital_twin_with_rag.py  (inspired by open-notebook)
 pytest -v
 ```
 
-53 unit tests covering the MCP server (19) and enhanced RAG pipeline (34), plus 34 tests for the KB source loaders (68 + 34 = 102 total).
+53 unit tests covering the MCP server (19) and enhanced RAG pipeline (34), plus 34 tests for the KB source loaders and 47 tests for the Lambda handler (134 total).
 
 ---
 
@@ -252,6 +375,9 @@ pytest -v
 | `MSR_OPENALEX_MAX_RESULTS` | `100` | Max OpenAlex papers per run |
 | `MSR_OPENALEX_EMAIL` | _(unset)_ | Email for OpenAlex polite pool |
 | `MSR_GITHUB_TOKEN` | _(unset)_ | GitHub PAT for higher API rate limits |
+| `MSR_KB_S3_BUCKET` | _(unset)_ | S3 bucket for Lambda KB persistence |
+| `MSR_KB_S3_PREFIX` | `kb-prod/` | S3 key prefix inside the bucket |
+| `MSR_API_KEY` | _(unset)_ | Shared API key for Lambda HTTP auth |
 
 ---
 
