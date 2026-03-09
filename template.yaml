@@ -69,6 +69,46 @@ Parameters:
       EventBridge schedule expression for periodic KB updates.
       Examples: "rate(1 day)", "cron(0 2 * * ? *)" (daily at 02:00 UTC).
 
+  UseLocalGPU:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Set to "true" to deploy the GPU container variant
+      (MSRKBGPUFunction) which uses local sentence-transformers and a
+      HuggingFace causal-LM instead of the OpenAI API.
+      The GPU container image must be built and pushed to ECR first
+      (see Makefile: make build-gpu-container push-gpu-container).
+      NOTE: AWS Lambda does not currently support GPU instances.
+      The GPU container is intended for ECS/EKS/EC2 deployments.
+
+  GPUContainerImageUri:
+    Type: String
+    Default: ""
+    Description: >
+      ECR image URI for the GPU-capable container
+      (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/msr-kb-gpu:latest).
+      Required when UseLocalGPU is "true".
+
+  LocalEmbedModel:
+    Type: String
+    Default: "sentence-transformers/all-MiniLM-L6-v2"
+    Description: HuggingFace model ID for local GPU embeddings.
+
+  LocalLLMModel:
+    Type: String
+    Default: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    Description: HuggingFace model ID for local GPU text generation.
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+
+Conditions:
+  DeployGPUFunction: !And
+    - !Equals [!Ref UseLocalGPU, "true"]
+    - !Not [!Equals [!Ref GPUContainerImageUri, ""]]
+
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
@@ -230,6 +270,106 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/msr-kb-service-${Environment}"
       RetentionInDays: 30
 
+  # -----------------------------------------------------------------------
+  # GPU container Lambda function (optional; requires ECR image)
+  # -----------------------------------------------------------------------
+  # AWS Lambda does not currently support GPU instances.  This function
+  # definition is provided so the GPU container image can be deployed as a
+  # standard Lambda function today (CPU inference) and will automatically
+  # take advantage of GPU hardware when Lambda adds GPU support.
+  #
+  # For GPU inference NOW, deploy the same container image to:
+  #   - Amazon ECS with the NVIDIA Container Toolkit
+  #   - AWS Batch GPU compute environments
+  #   - EC2 G/P instances running the Lambda Runtime Interface Emulator
+  #
+  # Condition: only created when UseLocalGPU == "true" AND a container
+  # image URI is provided.
+
+  MSRKBGPUFunction:
+    Type: AWS::Serverless::Function
+    Condition: DeployGPUFunction
+    Properties:
+      FunctionName: !Sub "msr-kb-service-gpu-${Environment}"
+      Description: >
+        MSR Knowledge Base Service – GPU container variant.
+        Uses local sentence-transformers + HuggingFace LLM instead of OpenAI API.
+      PackageType: Image
+      ImageUri: !Ref GPUContainerImageUri
+      MemorySize: 10240   # 10 GB – maximum Lambda memory; fits LLM weights
+      Timeout: 900
+      Tracing: Active
+      Architectures:
+        - x86_64
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref KBStoreBucket
+        - CloudWatchLogsFullAccess
+      Environment:
+        Variables:
+          MSR_USE_LOCAL_GPU: "true"
+          MSR_LOCAL_EMBED_MODEL: !Ref LocalEmbedModel
+          MSR_LOCAL_LLM_MODEL: !Ref LocalLLMModel
+          MSR_HF_CACHE_DIR: /opt/hf_models
+          MSR_KB_DIR: /tmp/kb_store
+          MSR_DOCS_DIR: /tmp/docs
+          MSR_KB_S3_BUCKET: !Ref KBStoreBucket
+          MSR_KB_S3_PREFIX: !Sub "kb-gpu-${Environment}/"
+          MSR_API_KEY: !Ref MsrApiKey
+          MSR_OPENALEX_EMAIL: !Ref OpenAlexEmail
+          MSR_GITHUB_TOKEN: !Ref GithubToken
+          POWERTOOLS_SERVICE_NAME: msr-kb-service-gpu
+          LOG_LEVEL: INFO
+      Events:
+        HealthCheckGPU:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /gpu/health
+            Method: GET
+        MCPEndpointGPU:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /gpu/mcp
+            Method: POST
+        QueryEndpointGPU:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /gpu/query
+            Method: POST
+        KBUpdateEndpointGPU:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /gpu/kb/update
+            Method: POST
+        ScheduledKBUpdateGPU:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref KBUpdateSchedule
+            Name: !Sub "msr-kb-gpu-daily-update-${Environment}"
+            Description: Periodic KB refresh (GPU function)
+            Enabled: true
+            Input: |
+              {
+                "source": "aws.events",
+                "detail-type": "Scheduled Event",
+                "detail": "periodic-kb-update-gpu"
+              }
+      Tags:
+        Project: msr-data-layer
+        Environment: !Ref Environment
+        GPUMode: "true"
+
+  MSRKBGPUFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployGPUFunction
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/msr-kb-service-gpu-${Environment}"
+      RetentionInDays: 30
+
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
@@ -266,3 +406,18 @@ Outputs:
   LambdaFunctionArn:
     Description: ARN of the Lambda function
     Value: !GetAtt MSRKBFunction.Arn
+
+  GPUQueryEndpoint:
+    Description: GPU-accelerated plain-text RAG query endpoint (when DeployGPUFunction=true)
+    Condition: DeployGPUFunction
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/gpu/query"
+
+  GPUMCPEndpoint:
+    Description: GPU-accelerated MCP JSON-RPC 2.0 endpoint (when DeployGPUFunction=true)
+    Condition: DeployGPUFunction
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/gpu/mcp"
+
+  GPULambdaFunctionArn:
+    Description: ARN of the GPU Lambda function (when DeployGPUFunction=true)
+    Condition: DeployGPUFunction
+    Value: !GetAtt MSRKBGPUFunction.Arn

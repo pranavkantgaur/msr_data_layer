@@ -40,6 +40,14 @@ MSR_OPENAI_MODEL      Chat model (default: gpt-4o-mini)
 MSR_EMBED_MODEL       Embedding model (default: text-embedding-3-small)
 MSR_DOCS_DIR          Reference documents directory (default: ./docs)
 MSR_KB_DIR            Persistent knowledge-base directory (default: ./kb_store)
+MSR_USE_LOCAL_GPU     Set to ``true`` to use local GPU models instead of the
+                      OpenAI API (requires sentence-transformers + transformers)
+MSR_LOCAL_EMBED_MODEL HuggingFace model ID for local embeddings
+                      (default: sentence-transformers/all-MiniLM-L6-v2)
+MSR_LOCAL_LLM_MODEL   HuggingFace model ID for local text generation
+                      (default: TinyLlama/TinyLlama-1.1B-Chat-v1.0)
+MSR_HF_CACHE_DIR      HuggingFace model cache directory
+                      (default: /tmp/hf_cache)
 
 Document Sources
 ----------------
@@ -71,13 +79,19 @@ import textwrap
 import urllib.request
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     import numpy as np  # type: ignore[import-untyped]
     _NUMPY_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _NUMPY_AVAILABLE = False
+
+try:
+    import torch  # type: ignore[import-untyped]
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
 
 from msr_digital_twin_client import MSRDigitalTwinClient
 
@@ -271,6 +285,228 @@ class OpenAIEmbeddingEngine(EmbeddingEngine):
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
         return [item["embedding"] for item in data["data"]]
+
+
+# ---------------------------------------------------------------------------
+# GPU helpers
+# ---------------------------------------------------------------------------
+
+def _gpu_device() -> str:
+    """
+    Return the best available torch device string.
+
+    Priority: ``cuda`` → ``mps`` (Apple Silicon) → ``cpu``.
+    """
+    if _TORCH_AVAILABLE:
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+    return "cpu"
+
+
+class LocalGPUEmbeddingEngine(EmbeddingEngine):
+    """
+    GPU-accelerated embedding engine using *sentence-transformers*.
+
+    Uses ``cuda`` when available, falls back to ``mps`` (Apple Silicon) then
+    ``cpu``.  Model files are downloaded from HuggingFace Hub on first use
+    and cached at ``MSR_HF_CACHE_DIR`` (default: ``/tmp/hf_cache``).
+
+    This engine is selected when ``MSR_USE_LOCAL_GPU=true`` and
+    ``sentence-transformers`` is installed.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+        Default: ``sentence-transformers/all-MiniLM-L6-v2`` (384-dim, ~90 MB).
+    device : str | None
+        Torch device string (``"cuda"``, ``"mps"``, ``"cpu"``).
+        Auto-detected if ``None``.
+    batch_size : int
+        Batch size passed to ``SentenceTransformer.encode()``.
+
+    Raises
+    ------
+    ImportError
+        If ``sentence-transformers`` is not installed.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        device: str | None = None,
+        batch_size: int = 32,
+    ) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore[import-untyped]  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "LocalGPUEmbeddingEngine requires 'sentence-transformers'. "
+                "Install it with: pip install sentence-transformers"
+            ) from exc
+
+        self._batch_size = batch_size
+        self._device = device or _gpu_device()
+        # Set HuggingFace cache to writable Lambda /tmp directory
+        cache_dir = os.environ.get("MSR_HF_CACHE_DIR", "/tmp/hf_cache")
+        os.environ.setdefault("HF_HOME", cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        self._model = SentenceTransformer(model_name, device=self._device, cache_folder=cache_dir)
+
+    def embed(self, text: str) -> list[float]:
+        return self.embed_batch([text])[0]
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        vectors = self._model.encode(
+            texts,
+            batch_size=self._batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return [v.tolist() for v in vectors]
+
+    @property
+    def device(self) -> str:
+        """Torch device being used (``"cuda"``, ``"mps"``, or ``"cpu"``)."""
+        return self._device
+
+
+class LocalGPULLM:
+    """
+    GPU-accelerated text-generation LLM using HuggingFace *transformers*.
+
+    Provides a ``generate(messages, max_new_tokens)`` method that mirrors the
+    interface of the OpenAI chat-completions endpoint, so it can be used as a
+    drop-in replacement inside the RAG pipeline.
+
+    Uses ``cuda`` when available, falls back to ``mps`` then ``cpu``.
+    Model files are cached at ``MSR_HF_CACHE_DIR`` (default: ``/tmp/hf_cache``).
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+        Default: ``TinyLlama/TinyLlama-1.1B-Chat-v1.0`` (~600 MB on disk,
+        fits in Lambda's 10 GB container limit).
+    device : str | None
+        Torch device string.  Auto-detected if ``None``.
+    load_in_8bit : bool
+        Quantise to 8-bit integers via *bitsandbytes* to halve GPU memory use.
+        Requires ``bitsandbytes`` to be installed and a CUDA device.
+    torch_dtype : str | None
+        Floating-point dtype for model weights: ``"float16"`` (default on GPU)
+        or ``"float32"`` (default on CPU).
+
+    Raises
+    ------
+    ImportError
+        If ``transformers`` is not installed.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        device: str | None = None,
+        load_in_8bit: bool = False,
+        torch_dtype: str | None = None,
+    ) -> None:
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline  # type: ignore[import-untyped]  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "LocalGPULLM requires 'transformers'. "
+                "Install it with: pip install transformers accelerate"
+            ) from exc
+
+        self._device = device or _gpu_device()
+        cache_dir = os.environ.get("MSR_HF_CACHE_DIR", "/tmp/hf_cache")
+        os.environ.setdefault("HF_HOME", cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Select dtype: float16 on GPU, float32 on CPU
+        if torch_dtype is None:
+            torch_dtype = "float16" if self._device != "cpu" and _TORCH_AVAILABLE else "float32"
+
+        _torch_dtype = getattr(torch, torch_dtype) if _TORCH_AVAILABLE else None
+
+        load_kwargs: dict[str, Any] = {
+            "cache_dir": cache_dir,
+            "torch_dtype": _torch_dtype,
+        }
+        if load_in_8bit and self._device == "cuda":
+            load_kwargs["load_in_8bit"] = True
+        elif self._device != "cpu":
+            load_kwargs["device_map"] = "auto"
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+
+        pipe_device: Any = -1  # CPU for transformers pipeline
+        if self._device == "cuda":
+            pipe_device = 0
+        elif self._device == "mps":
+            pipe_device = "mps"
+
+        self._pipeline = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            device=pipe_device if not load_kwargs.get("device_map") else None,
+        )
+        self._model_name = model_name
+
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        max_new_tokens: int = 1024,
+    ) -> str:
+        """
+        Generate a response for a chat-style message list.
+
+        Applies the tokenizer's chat template when available (e.g. TinyLlama
+        uses the ChatML format), otherwise concatenates role/content pairs.
+
+        Parameters
+        ----------
+        messages : list[dict[str, str]]
+            List of ``{"role": ..., "content": ...}`` dicts.
+        max_new_tokens : int
+            Maximum number of new tokens to generate.
+
+        Returns
+        -------
+        str
+            The assistant's reply text (stripped).
+        """
+        tokenizer = self._pipeline.tokenizer
+        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            prompt = "\n".join(
+                f"<|{m['role']}|>\n{m['content']}" for m in messages
+            ) + "\n<|assistant|>\n"
+
+        outputs = self._pipeline(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            pad_token_id=self._pipeline.tokenizer.eos_token_id,
+            return_full_text=False,
+        )
+        return outputs[0]["generated_text"].strip()
+
+    @property
+    def device(self) -> str:
+        """Torch device being used."""
+        return self._device
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +809,8 @@ def _decompose_query(
     api_key: str,
     base_url: str,
     model: str,
+    *,
+    generate_fn: Callable[[list[dict[str, str]], int], str] | None = None,
 ) -> list[SubQuery]:
     """
     Use the LLM to decompose *question* into ≤ 5 targeted sub-queries.
@@ -583,6 +821,13 @@ def _decompose_query(
 
     Falls back to a single sub-query equal to the original question if the
     LLM call fails or the response cannot be parsed.
+
+    Parameters
+    ----------
+    generate_fn : callable, optional
+        If provided, used for generation instead of the OpenAI API.
+        Signature: ``generate_fn(messages, max_tokens) -> str``.
+        When ``None`` the OpenAI API is used (``api_key`` must be set).
     """
     system = textwrap.dedent("""\
         You are a search strategy planner for a Molten Salt Reactor (MSR) \
@@ -601,16 +846,19 @@ cover all aspects needed to answer the question fully.
           ]
         }
     """)
+
+    def _do_generate(messages: list[dict[str, str]], max_tokens: int) -> str:
+        if generate_fn is not None:
+            return generate_fn(messages, max_tokens)
+        return _call_llm(messages, api_key, base_url, model, max_tokens)
+
     try:
-        response = _call_llm(
+        response = _do_generate(
             [
                 {"role": "system", "content": system},
                 {"role": "user", "content": f"Question: {question}"},
             ],
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            max_tokens=512,
+            512,
         )
         match = re.search(r"\{.*\}", response, re.DOTALL)
         if not match:
@@ -638,6 +886,8 @@ def _extract_insight(
     api_key: str,
     base_url: str,
     model: str,
+    *,
+    generate_fn: Callable[[list[dict[str, str]], int], str] | None = None,
 ) -> SourceInsight:
     """
     Generate a structured :class:`SourceInsight` for a document using the LLM.
@@ -645,6 +895,12 @@ def _extract_insight(
     Inspired by open-notebook's source transformation/insight pipeline in
     ``source.py`` which generates insights (summaries, key points, etc.) for
     each ingested source and stores them alongside the document embeddings.
+
+    Parameters
+    ----------
+    generate_fn : callable, optional
+        If provided, used for generation instead of the OpenAI API.
+        Signature: ``generate_fn(messages, max_tokens) -> str``.
     """
     preview = text[:3000]
     system = textwrap.dedent("""\
@@ -661,16 +917,19 @@ def _extract_insight(
           "key_facts": ["fact1", "fact2"]
         }
     """)
+
+    def _do_generate(messages: list[dict[str, str]], max_tokens: int) -> str:
+        if generate_fn is not None:
+            return generate_fn(messages, max_tokens)
+        return _call_llm(messages, api_key, base_url, model, max_tokens)
+
     try:
-        response = _call_llm(
+        response = _do_generate(
             [
                 {"role": "system", "content": system},
                 {"role": "user", "content": f"Document:\n{preview}"},
             ],
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            max_tokens=512,
+            512,
         )
         match = re.search(r"\{.*\}", response, re.DOTALL)
         if not match:
@@ -715,6 +974,9 @@ class MSRDigitalTwinRAG:
        reactor data into a coherent, well-cited answer.
     7. **Hybrid retrieval** – dense cosine + sparse TF-IDF weighted average.
     8. **Persistent knowledge base** – avoids re-embedding on restart.
+    9. **Local GPU models** – sentence-transformers for embeddings and a
+       HuggingFace causal-LM for generation when ``MSR_USE_LOCAL_GPU=true``
+       (CUDA/MPS when available, CPU fallback).
     """
 
     def __init__(self, docs_dir: str | Path | None = None) -> None:
@@ -727,9 +989,28 @@ class MSRDigitalTwinRAG:
             "MSR_EMBED_MODEL", "text-embedding-3-small"
         )
 
-        # Choose embedding engine
-        if self._api_key:
-            self._embed_engine: EmbeddingEngine = OpenAIEmbeddingEngine(
+        # Local GPU configuration
+        _use_local_gpu = os.environ.get("MSR_USE_LOCAL_GPU", "").lower() in (
+            "1", "true", "yes"
+        )
+        _local_embed_model = os.environ.get(
+            "MSR_LOCAL_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+        )
+        _local_llm_model = os.environ.get(
+            "MSR_LOCAL_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        )
+
+        # Engine selection: local GPU > OpenAI API > random projection
+        self._local_llm: LocalGPULLM | None = None
+        if _use_local_gpu:
+            self._embed_engine: EmbeddingEngine = LocalGPUEmbeddingEngine(
+                model_name=_local_embed_model,
+            )
+            self._local_llm = LocalGPULLM(model_name=_local_llm_model)
+            _device = self._embed_engine.device  # type: ignore[attr-defined]
+            print(f"[RAG] Local GPU mode enabled (device={_device}).")
+        elif self._api_key:
+            self._embed_engine = OpenAIEmbeddingEngine(
                 api_key=self._api_key,
                 base_url=self._base_url,
                 model=self._embed_model,
@@ -753,15 +1034,51 @@ class MSRDigitalTwinRAG:
             )
 
     # ------------------------------------------------------------------
+    # LLM dispatch
+    # ------------------------------------------------------------------
+
+    def _llm_generate(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int = 1024,
+    ) -> str:
+        """
+        Route a generation request to the configured LLM backend.
+
+        Priority:
+        1. Local GPU LLM (when ``MSR_USE_LOCAL_GPU=true``)
+        2. OpenAI-compatible API (when ``MSR_OPENAI_API_KEY`` is set)
+        3. Raises ``RuntimeError`` if neither is available.
+        """
+        if self._local_llm is not None:
+            return self._local_llm.generate(messages, max_new_tokens=max_tokens)
+        if self._api_key:
+            return _call_llm(messages, self._api_key, self._base_url, self._model, max_tokens)
+        raise RuntimeError(
+            "No LLM backend configured. "
+            "Set MSR_OPENAI_API_KEY for the OpenAI API, or "
+            "MSR_USE_LOCAL_GPU=true for local GPU inference."
+        )
+
+    def _has_llm(self) -> bool:
+        """Return True if an LLM backend (local GPU or OpenAI API) is configured."""
+        return self._local_llm is not None or bool(self._api_key)
+
+    # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     def add_document(self, text: str, source: str = "") -> int:
         """Programmatically add a document to the knowledge base."""
         insight = None
-        if self._api_key:
+        if self._has_llm():
             insight = _extract_insight(
-                text, source, self._api_key, self._base_url, self._model
+                text,
+                source,
+                self._api_key,
+                self._base_url,
+                self._model,
+                generate_fn=self._llm_generate,
             )
         return self._kb.add_document(text, source=source, insight=insight)
 
@@ -812,18 +1129,20 @@ class MSRDigitalTwinRAG:
         """
         Answer *question* using the multi-step RAG pipeline.
 
-        If no LLM is configured (``MSR_OPENAI_API_KEY`` unset), returns a
-        structured context summary that the caller can pass to their own LLM.
+        If no LLM is configured (neither ``MSR_OPENAI_API_KEY`` nor
+        ``MSR_USE_LOCAL_GPU=true``), returns a structured context summary
+        that the caller can pass to their own LLM.
         """
         reactor_context = self._fetch_reactor_context()
 
-        if not self._api_key:
+        if not self._has_llm():
             chunks = self._kb.search(question, top_k=top_k)
             prompt = self._build_simple_prompt(
                 question, self._format_chunks(chunks), reactor_context
             )
             return (
-                "[No LLM configured – set MSR_OPENAI_API_KEY to enable generation]\n\n"
+                "[No LLM configured – set MSR_OPENAI_API_KEY or "
+                "MSR_USE_LOCAL_GPU=true to enable generation]\n\n"
                 + prompt
             )
 
@@ -833,6 +1152,7 @@ class MSRDigitalTwinRAG:
             api_key=self._api_key,
             base_url=self._base_url,
             model=self._model,
+            generate_fn=self._llm_generate,
         )
 
         # Step 2 – parallel search + sub-answer extraction
@@ -871,13 +1191,14 @@ class MSRDigitalTwinRAG:
                 if not text.strip():
                     continue
                 insight = None
-                if self._api_key:
+                if self._has_llm():
                     insight = _extract_insight(
                         text,
                         str(path),
                         self._api_key,
                         self._base_url,
                         self._model,
+                        generate_fn=self._llm_generate,
                     )
                 total += self._kb.add_document(
                     text, source=str(path), insight=insight
@@ -922,12 +1243,9 @@ class MSRDigitalTwinRAG:
         ]
 
         try:
-            return _call_llm(
+            return self._llm_generate(
                 [{"role": "user", "content": "\n".join(parts)}],
-                api_key=self._api_key,
-                base_url=self._base_url,
-                model=self._model,
-                max_tokens=512,
+                512,
             )
         except Exception as exc:  # noqa: BLE001
             import sys
@@ -978,12 +1296,9 @@ class MSRDigitalTwinRAG:
         """)
 
         try:
-            return _call_llm(
+            return self._llm_generate(
                 [{"role": "user", "content": prompt}],
-                api_key=self._api_key,
-                base_url=self._base_url,
-                model=self._model,
-                max_tokens=1024,
+                1024,
             )
         except Exception as exc:  # noqa: BLE001
             import sys

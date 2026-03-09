@@ -9,6 +9,12 @@ Tests cover:
 - SourceInsight dataclass
 - SubQuery dataclass
 - MSRDigitalTwinRAG (no-LLM path)
+- MSRDigitalTwinRAG (local GPU path – mocked)
+- LocalGPUEmbeddingEngine (mocked sentence-transformers)
+- LocalGPULLM (mocked transformers)
+- _gpu_device() helper
+- _decompose_query with generate_fn
+- _extract_insight with generate_fn
 - Query decomposition fallback (no API key)
 - json_encode / json_decode compatibility shims
 """
@@ -16,21 +22,27 @@ Tests cover:
 import json
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from msr_digital_twin_with_rag import (
     DocumentChunk,
     KnowledgeBase,
+    LocalGPUEmbeddingEngine,
+    LocalGPULLM,
     MSRDigitalTwinRAG,
     OpenAIEmbeddingEngine,
     RandomProjectionEmbeddingEngine,
     SourceInsight,
     SubQuery,
+    _TORCH_AVAILABLE,
     _chunk_text,
     _cosine_dense,
     _cosine_sparse,
     _decompose_query,
+    _extract_insight,
+    _gpu_device,
     _tokenize,
     json_decode,
     json_encode,
@@ -387,6 +399,285 @@ def test_decompose_query_fallback_no_api():
     assert isinstance(result, list)
     assert len(result) >= 1
     assert isinstance(result[0], SubQuery)
+
+
+def test_decompose_query_with_generate_fn():
+    """generate_fn is called instead of OpenAI when provided."""
+    called = []
+
+    def fake_generate(messages, max_tokens):
+        called.append(messages)
+        return '{"searches": [{"term": "salt temperature", "instructions": "find limits"}]}'
+
+    result = _decompose_query(
+        "What are salt temperature limits?",
+        api_key="",
+        base_url="",
+        model="",
+        generate_fn=fake_generate,
+    )
+    assert len(called) == 1
+    assert isinstance(result, list)
+    assert result[0].term == "salt temperature"
+
+
+def test_extract_insight_with_generate_fn():
+    """generate_fn is called instead of OpenAI when provided."""
+    def fake_generate(messages, max_tokens):
+        return '{"summary": "Test summary.", "topics": ["topic1"], "key_facts": ["fact1"]}'
+
+    insight = _extract_insight(
+        "Molten salt reactor operating at 700 degrees.",
+        "test_doc",
+        api_key="",
+        base_url="",
+        model="",
+        generate_fn=fake_generate,
+    )
+    assert isinstance(insight, SourceInsight)
+    assert insight.summary == "Test summary."
+    assert "topic1" in insight.topics
+
+
+def test_extract_insight_generate_fn_fallback_on_error():
+    """A generate_fn that raises returns an empty SourceInsight."""
+    def bad_generate(messages, max_tokens):
+        raise RuntimeError("model error")
+
+    insight = _extract_insight(
+        "some text",
+        "doc",
+        api_key="",
+        base_url="",
+        model="",
+        generate_fn=bad_generate,
+    )
+    assert isinstance(insight, SourceInsight)
+    assert insight.summary == "[Insight extraction failed]"
+
+
+# ---------------------------------------------------------------------------
+# _gpu_device helper
+# ---------------------------------------------------------------------------
+
+def test_gpu_device_returns_string():
+    device = _gpu_device()
+    assert device in ("cuda", "mps", "cpu")
+
+
+def test_gpu_device_cpu_when_torch_unavailable():
+    """When torch is not importable, _gpu_device falls back to 'cpu'."""
+    import msr_digital_twin_with_rag as rag_mod
+    original = rag_mod._TORCH_AVAILABLE
+    try:
+        rag_mod._TORCH_AVAILABLE = False
+        assert _gpu_device() == "cpu"
+    finally:
+        rag_mod._TORCH_AVAILABLE = original
+
+
+# ---------------------------------------------------------------------------
+# LocalGPUEmbeddingEngine (mocked sentence-transformers)
+# ---------------------------------------------------------------------------
+
+class TestLocalGPUEmbeddingEngine:
+    def _make_mock_st(self, dim: int = 384):
+        """Return a mock SentenceTransformer that returns fixed-size embeddings."""
+        import numpy as np
+        mock_st = MagicMock()
+        mock_st.encode.return_value = np.ones((1, dim), dtype=np.float32)
+        return mock_st
+
+    def test_embed_returns_list(self):
+        mock_st = self._make_mock_st(dim=384)
+        with patch.dict("sys.modules", {
+            "sentence_transformers": MagicMock(SentenceTransformer=MagicMock(return_value=mock_st))
+        }):
+            engine = LocalGPUEmbeddingEngine(model_name="test/model", device="cpu")
+            result = engine.embed("core temperature")
+        assert isinstance(result, list)
+        assert len(result) == 384
+
+    def test_embed_batch_returns_list_of_lists(self):
+        import numpy as np
+        mock_st = MagicMock()
+        mock_st.encode.return_value = np.ones((3, 384), dtype=np.float32)
+        with patch.dict("sys.modules", {
+            "sentence_transformers": MagicMock(SentenceTransformer=MagicMock(return_value=mock_st))
+        }):
+            engine = LocalGPUEmbeddingEngine(model_name="test/model", device="cpu")
+            results = engine.embed_batch(["a", "b", "c"])
+        assert len(results) == 3
+        assert all(isinstance(r, list) for r in results)
+
+    def test_device_property(self):
+        mock_st = self._make_mock_st()
+        with patch.dict("sys.modules", {
+            "sentence_transformers": MagicMock(SentenceTransformer=MagicMock(return_value=mock_st))
+        }):
+            engine = LocalGPUEmbeddingEngine(model_name="test/model", device="cpu")
+        assert engine.device == "cpu"
+
+    def test_raises_on_missing_sentence_transformers(self):
+        import sys
+        orig = sys.modules.pop("sentence_transformers", None)
+        try:
+            with patch.dict("sys.modules", {"sentence_transformers": None}):
+                with pytest.raises(ImportError, match="sentence-transformers"):
+                    LocalGPUEmbeddingEngine(model_name="test/model")
+        finally:
+            if orig is not None:
+                sys.modules["sentence_transformers"] = orig
+
+
+# ---------------------------------------------------------------------------
+# LocalGPULLM (mocked transformers)
+# ---------------------------------------------------------------------------
+
+class TestLocalGPULLM:
+    def _make_mock_pipeline(self):
+        """Return a mock HuggingFace pipeline."""
+        mock_pipe = MagicMock()
+        mock_pipe.return_value = [{"generated_text": "  test answer  "}]
+        mock_pipe.tokenizer = MagicMock()
+        mock_pipe.tokenizer.eos_token_id = 2
+        mock_pipe.tokenizer.chat_template = None  # no chat template
+        return mock_pipe
+
+    def _make_transformers_mock(self, mock_pipe):
+        mock_transformers = MagicMock()
+        mock_transformers.AutoTokenizer.from_pretrained.return_value = MagicMock()
+        mock_transformers.AutoModelForCausalLM.from_pretrained.return_value = MagicMock()
+        mock_transformers.pipeline.return_value = mock_pipe
+        return mock_transformers
+
+    def test_generate_returns_string(self):
+        mock_pipe = self._make_mock_pipeline()
+        mock_transformers = self._make_transformers_mock(mock_pipe)
+        with patch.dict("sys.modules", {"transformers": mock_transformers}):
+            llm = LocalGPULLM(model_name="test/llm", device="cpu")
+            result = llm.generate([{"role": "user", "content": "hello"}])
+        assert isinstance(result, str)
+        assert result == "test answer"
+
+    def test_generate_with_chat_template(self):
+        mock_pipe = self._make_mock_pipeline()
+        mock_pipe.tokenizer.chat_template = "some_template"
+        mock_pipe.tokenizer.apply_chat_template.return_value = "<chat>hello</chat>"
+        mock_transformers = self._make_transformers_mock(mock_pipe)
+        with patch.dict("sys.modules", {"transformers": mock_transformers}):
+            llm = LocalGPULLM(model_name="test/llm", device="cpu")
+            result = llm.generate([{"role": "user", "content": "hello"}])
+        mock_pipe.tokenizer.apply_chat_template.assert_called_once()
+        assert isinstance(result, str)
+
+    def test_device_property(self):
+        mock_pipe = self._make_mock_pipeline()
+        mock_transformers = self._make_transformers_mock(mock_pipe)
+        with patch.dict("sys.modules", {"transformers": mock_transformers}):
+            llm = LocalGPULLM(model_name="test/llm", device="cpu")
+        assert llm.device == "cpu"
+
+    def test_raises_on_missing_transformers(self):
+        import sys
+        orig = sys.modules.pop("transformers", None)
+        try:
+            with patch.dict("sys.modules", {"transformers": None}):
+                with pytest.raises(ImportError, match="transformers"):
+                    LocalGPULLM(model_name="test/llm")
+        finally:
+            if orig is not None:
+                sys.modules["transformers"] = orig
+
+
+# ---------------------------------------------------------------------------
+# MSRDigitalTwinRAG – local GPU engine selection
+# ---------------------------------------------------------------------------
+
+class TestMSRDigitalTwinRAGGPU:
+    def _mock_engine(self, dim: int = 384):
+        import numpy as np
+        mock_st = MagicMock()
+        mock_st.encode.return_value = np.ones((1, dim), dtype=np.float32)
+        return mock_st
+
+    def test_local_gpu_mode_selects_local_engine(self, tmp_path, monkeypatch):
+        """When MSR_USE_LOCAL_GPU=true, a LocalGPUEmbeddingEngine is created."""
+        monkeypatch.setenv("MSR_USE_LOCAL_GPU", "true")
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
+        monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+
+        mock_st_instance = self._mock_engine()
+        mock_st_cls = MagicMock(return_value=mock_st_instance)
+        mock_st_module = MagicMock(SentenceTransformer=mock_st_cls)
+
+        mock_pipe = MagicMock()
+        mock_pipe.return_value = [{"generated_text": "answer"}]
+        mock_pipe.tokenizer = MagicMock(eos_token_id=2, chat_template=None)
+        mock_transformers = MagicMock()
+        mock_transformers.AutoTokenizer.from_pretrained.return_value = MagicMock()
+        mock_transformers.AutoModelForCausalLM.from_pretrained.return_value = MagicMock()
+        mock_transformers.pipeline.return_value = mock_pipe
+
+        with patch.dict("sys.modules", {
+            "sentence_transformers": mock_st_module,
+            "transformers": mock_transformers,
+        }):
+            rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
+
+        assert isinstance(rag._embed_engine, LocalGPUEmbeddingEngine)
+        assert rag._local_llm is not None
+        assert rag._has_llm() is True
+
+    def test_local_gpu_mode_false_uses_random_projection(self, tmp_path, monkeypatch):
+        """When MSR_USE_LOCAL_GPU is not set and no API key, random projection is used."""
+        monkeypatch.setenv("MSR_USE_LOCAL_GPU", "false")
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
+        monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+        rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
+        assert isinstance(rag._embed_engine, RandomProjectionEmbeddingEngine)
+        assert rag._local_llm is None
+        assert rag._has_llm() is False
+
+    def test_has_llm_false_without_backends(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("MSR_USE_LOCAL_GPU", "false")
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
+        rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
+        assert rag._has_llm() is False
+
+    def test_answer_no_llm_mentions_local_gpu(self, tmp_path, monkeypatch):
+        """answer() message now mentions MSR_USE_LOCAL_GPU."""
+        monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("MSR_USE_LOCAL_GPU", "false")
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
+        rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
+        answer = rag.answer("What is the status?")
+        assert "MSR_USE_LOCAL_GPU" in answer or "MSR_OPENAI_API_KEY" in answer
+
+    def test_llm_generate_local_path(self, tmp_path, monkeypatch):
+        """_llm_generate routes to the local LLM when configured."""
+        monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
+        rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
+
+        mock_llm = MagicMock()
+        mock_llm.generate.return_value = "mock response"
+        rag._local_llm = mock_llm
+
+        result = rag._llm_generate([{"role": "user", "content": "test"}], 512)
+        mock_llm.generate.assert_called_once()
+        assert result == "mock response"
+
+    def test_llm_generate_raises_without_backends(self, tmp_path, monkeypatch):
+        """_llm_generate raises RuntimeError when neither OpenAI nor local GPU is set."""
+        monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
+        rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
+        rag._local_llm = None
+        rag._api_key = ""
+        with pytest.raises(RuntimeError, match="No LLM backend"):
+            rag._llm_generate([{"role": "user", "content": "test"}])
 
 
 # ---------------------------------------------------------------------------

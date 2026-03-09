@@ -21,18 +21,20 @@ parallel-search approach.
 | `msr_mcp_server.py` | Core MCP server – tool handlers, JSON-RPC dispatcher |
 | `msr_mcp_server_main.py` | Entry point – stdio transport server |
 | `msr_digital_twin_client.py` | Python client for the MCP server |
-| `msr_digital_twin_with_rag.py` | Enhanced multi-step RAG pipeline |
+| `msr_digital_twin_with_rag.py` | Enhanced multi-step RAG pipeline (+ GPU engines) |
 | `msr_kb_sources.py` | KB source loaders: msr-archive (static) + OpenAlex (dynamic) |
 | `lambda_function.py` | AWS Lambda handler (HTTP API + EventBridge scheduler) |
-| `template.yaml` | AWS SAM template (Lambda + API Gateway + S3) |
-| `Makefile` | Build / deploy / local-dev convenience targets |
+| `template.yaml` | AWS SAM template (Lambda + API Gateway + S3 + GPU variant) |
+| `Dockerfile.gpu` | GPU-capable container image (CUDA + sentence-transformers + transformers) |
+| `Makefile` | Build / deploy / local-dev / GPU container targets |
 | `requirements_mcp.txt` | Core Python dependencies |
 | `requirements_lambda.txt` | Lambda-specific dependencies (adds boto3) |
+| `requirements_gpu.txt` | GPU-specific dependencies (torch, sentence-transformers, transformers) |
 | `00_MCP_START_HERE.md` | Quick-start guide |
 | `MSR_DIGITAL_TWIN_MCP_GUIDE.md` | Full architecture and tool reference |
 | `MSR_MCP_DEPLOYMENT_GUIDE.md` | Deployment and production guide |
 | `test_msr_mcp_server.py` | Unit tests for MCP server |
-| `test_msr_rag.py` | Unit tests for enhanced RAG pipeline |
+| `test_msr_rag.py` | Unit tests for RAG pipeline (including GPU engine tests) |
 | `test_msr_kb_sources.py` | Unit tests for KB source loaders |
 | `test_lambda_function.py` | Unit tests for Lambda handler |
 
@@ -188,6 +190,101 @@ Re-running the updater only adds truly new content.
 ```cron
 # Update knowledge base daily at 02:00 UTC
 0 2 * * *  cd /opt/msr && python msr_kb_sources.py --update-all >> logs/kb_update.log 2>&1
+```
+
+---
+
+## GPU-Accelerated Local Models (`LocalGPUEmbeddingEngine` + `LocalGPULLM`)
+
+When `MSR_USE_LOCAL_GPU=true` the pipeline replaces the OpenAI API calls with
+fully local, GPU-accelerated models:
+
+| Component | Default model | Library | VRAM |
+|---|---|---|---|
+| **Embeddings** | `sentence-transformers/all-MiniLM-L6-v2` | sentence-transformers | ~200 MB |
+| **Text generation** | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | 🤗 transformers | ~2 GB (fp16) |
+
+Both models auto-detect CUDA → MPS (Apple Silicon) → CPU and fall back
+gracefully.
+
+### Engine-selection priority
+
+```
+MSR_USE_LOCAL_GPU=true  →  LocalGPUEmbeddingEngine + LocalGPULLM
+MSR_OPENAI_API_KEY set  →  OpenAIEmbeddingEngine  + OpenAI chat API
+(neither)               →  RandomProjectionEmbeddingEngine  (no LLM synthesis)
+```
+
+### Using GPU models locally
+
+```bash
+pip install -r requirements_gpu.txt
+export MSR_USE_LOCAL_GPU=true
+# Optional: choose different models
+export MSR_LOCAL_EMBED_MODEL=BAAI/bge-small-en-v1.5
+export MSR_LOCAL_LLM_MODEL=microsoft/phi-2
+python msr_digital_twin_with_rag.py "What is the safe core temperature?"
+```
+
+### GPU container image
+
+A CUDA-capable Docker container image is provided in `Dockerfile.gpu`:
+
+```bash
+# Build (pre-downloads model weights into the image)
+make build-gpu-container
+
+# Run locally on CPU (no GPU required for testing)
+make run-gpu-local
+
+# Run with NVIDIA GPU
+make run-gpu-cuda
+
+# Build with different models
+docker build -f Dockerfile.gpu \
+  --build-arg EMBED_MODEL=BAAI/bge-small-en-v1.5 \
+  --build-arg LLM_MODEL=microsoft/phi-2 \
+  -t msr-kb-gpu .
+```
+
+The container bundles model weights so that cold-start latency is minimal (no
+HuggingFace Hub download on first request).
+
+### GPU Lambda deployment
+
+```bash
+# 1. Push GPU image to ECR
+make create-ecr-repo
+make push-gpu-container ECR_REPO=<your-ecr-uri>
+
+# 2. Deploy GPU Lambda variant (hosted on /gpu/* routes)
+make deploy-gpu ECR_REPO=<your-ecr-uri>
+
+# 3. Query the GPU endpoint
+make remote-gpu-query QUESTION="What is the thermal efficiency of TMSR-LF1?"
+```
+
+> **Note:** AWS Lambda does not currently support GPU instances.  The GPU
+> container image runs on CPU within Lambda (still beneficial for
+> self-contained deployments without the OpenAI API key).  For true GPU
+> inference, deploy the same container image to **Amazon ECS** with the
+> NVIDIA Container Toolkit, **AWS Batch** GPU compute environments, or an
+> **EC2 G/P instance** running the Lambda Runtime Interface Emulator.
+
+### `/health` reports GPU status
+
+```json
+{
+  "service": "msr-knowledge-base",
+  "status": "healthy",
+  "gpu": {
+    "torch_available": true,
+    "device": "cuda",
+    "local_gpu_mode": true,
+    "embed_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "llm_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+  }
+}
 ```
 
 ---
@@ -355,7 +452,7 @@ msr_digital_twin_with_rag.py  (inspired by open-notebook)
 pytest -v
 ```
 
-53 unit tests covering the MCP server (19) and enhanced RAG pipeline (34), plus 34 tests for the KB source loaders and 47 tests for the Lambda handler (134 total).
+53 unit tests covering the MCP server (19) and enhanced RAG pipeline (53, including 19 GPU engine tests), plus 34 tests for the KB source loaders and 47 tests for the Lambda handler (153 total).
 
 ---
 
@@ -378,6 +475,10 @@ pytest -v
 | `MSR_KB_S3_BUCKET` | _(unset)_ | S3 bucket for Lambda KB persistence |
 | `MSR_KB_S3_PREFIX` | `kb-prod/` | S3 key prefix inside the bucket |
 | `MSR_API_KEY` | _(unset)_ | Shared API key for Lambda HTTP auth |
+| `MSR_USE_LOCAL_GPU` | `false` | `true` to use local GPU models |
+| `MSR_LOCAL_EMBED_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Local embedding model |
+| `MSR_LOCAL_LLM_MODEL` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | Local generation model |
+| `MSR_HF_CACHE_DIR` | `/tmp/hf_cache` | HuggingFace model cache directory |
 
 ---
 

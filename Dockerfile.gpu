@@ -1,0 +1,134 @@
+# Dockerfile.gpu – GPU-capable Lambda container image for the MSR Knowledge Base Service
+#
+# Packages the MSR data layer with PyTorch (CUDA 12.1), sentence-transformers,
+# and HuggingFace transformers so that embedding and text-generation can run
+# entirely on a GPU without calling the OpenAI API.
+#
+# AWS Lambda GPU support
+# ----------------------
+# AWS Lambda does not currently offer GPU instances.  This container image is
+# designed to run on:
+#
+#   1. GPU-capable AWS compute that exposes a Lambda-compatible interface:
+#      - Amazon ECS / EKS tasks with NVIDIA GPU device plugin
+#      - AWS Batch GPU jobs
+#      - EC2 G/P instances running the Lambda Runtime Interface Emulator (RIE)
+#
+#   2. Locally via Docker on any CUDA-capable machine:
+#      docker run --gpus all -p 9000:8080 msr-kb-gpu
+#
+# When/if AWS Lambda adds native GPU support (planned for future release) this
+# same image can be deployed directly.
+#
+# The container also runs correctly on CPU-only hosts – sentence-transformers
+# and transformers automatically fall back to CPU when CUDA is unavailable.
+#
+# Build arguments
+# ---------------
+# CUDA_VERSION   CUDA toolkit version (default: 12.1.0)
+# PYTHON_VERSION Python minor version (default: 3.12)
+# EMBED_MODEL    HuggingFace embedding model to pre-download (default: sentence-transformers/all-MiniLM-L6-v2)
+# LLM_MODEL      HuggingFace LLM to pre-download (default: TinyLlama/TinyLlama-1.1B-Chat-v1.0)
+#
+# Usage
+# -----
+# Build:
+#   docker build -f Dockerfile.gpu -t msr-kb-gpu .
+#
+# Build with different models:
+#   docker build -f Dockerfile.gpu \
+#     --build-arg EMBED_MODEL=BAAI/bge-small-en-v1.5 \
+#     --build-arg LLM_MODEL=microsoft/phi-2 \
+#     -t msr-kb-gpu .
+#
+# Run locally with GPU:
+#   docker run --gpus all \
+#     -p 9000:8080 \
+#     -e MSR_USE_LOCAL_GPU=true \
+#     -e MSR_API_KEY=mysecret \
+#     msr-kb-gpu
+#
+# Test the local container:
+#   curl -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+#     -d '{"rawPath":"/health","requestContext":{"http":{"method":"GET"}},"headers":{}}'
+
+ARG CUDA_VERSION=12.1.0
+ARG PYTHON_VERSION=3.12
+
+# ---------------------------------------------------------------------------
+# Base: NVIDIA CUDA runtime on Amazon Linux 2023 with Lambda RIC
+# ---------------------------------------------------------------------------
+# We build on the official Lambda Python base image which includes the
+# Runtime Interface Client (RIC) for Lambda invocations, then layer in
+# CUDA-capable PyTorch.
+FROM public.ecr.aws/lambda/python:${PYTHON_VERSION} AS base
+
+# Install system libraries required by PyTorch CUDA and sentence-transformers
+RUN dnf install -y \
+        libgomp \
+        gcc \
+        gcc-c++ \
+        git \
+    && dnf clean all
+
+# ---------------------------------------------------------------------------
+# Python dependencies
+# ---------------------------------------------------------------------------
+
+ARG EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
+ARG LLM_MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0
+
+# Install PyTorch with CUDA 12.1 support first (largest package, separate layer
+# for better build cache hit rate)
+RUN pip install --no-cache-dir \
+    torch \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# Install the remaining GPU dependencies
+RUN pip install --no-cache-dir \
+    sentence-transformers \
+    transformers \
+    accelerate \
+    huggingface_hub
+
+# Install the service's runtime dependencies
+COPY requirements_gpu.txt /tmp/requirements_gpu.txt
+RUN pip install --no-cache-dir -r /tmp/requirements_gpu.txt
+
+# ---------------------------------------------------------------------------
+# Pre-download models into the image
+# ---------------------------------------------------------------------------
+# Pre-downloading models into the image eliminates first-request cold-start
+# latency caused by downloading from HuggingFace Hub.
+# Increase the image size but dramatically improves P99 latency.
+#
+# Set HF_HOME to a fixed path inside the image.  The Lambda handler also
+# sets MSR_HF_CACHE_DIR → HF_HOME at runtime (see lambda_function.py).
+ENV HF_HOME=/opt/hf_models
+RUN python -c "\
+from sentence_transformers import SentenceTransformer; \
+SentenceTransformer('${EMBED_MODEL}', cache_folder='/opt/hf_models')" \
+    && python -c "\
+from transformers import AutoTokenizer, AutoModelForCausalLM; \
+AutoTokenizer.from_pretrained('${LLM_MODEL}', cache_dir='/opt/hf_models'); \
+AutoModelForCausalLM.from_pretrained('${LLM_MODEL}', cache_dir='/opt/hf_models')"
+
+# ---------------------------------------------------------------------------
+# Application code
+# ---------------------------------------------------------------------------
+
+COPY . ${LAMBDA_TASK_ROOT}/
+
+# ---------------------------------------------------------------------------
+# Runtime environment
+# ---------------------------------------------------------------------------
+
+ENV MSR_USE_LOCAL_GPU=true
+ENV MSR_LOCAL_EMBED_MODEL=${EMBED_MODEL}
+ENV MSR_LOCAL_LLM_MODEL=${LLM_MODEL}
+ENV MSR_HF_CACHE_DIR=/opt/hf_models
+ENV MSR_KB_DIR=/tmp/kb_store
+ENV MSR_DOCS_DIR=/tmp/docs
+
+# Lambda handler
+CMD ["lambda_function.lambda_handler"]

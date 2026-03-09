@@ -16,6 +16,13 @@
 #   make local-api                 # start local HTTP server on http://127.0.0.1:3000
 #   make local-health              # call the local /health endpoint
 #   make local-query               # send a test query to the local /query endpoint
+#
+# GPU container (for GPU-accelerated embeddings + generation)
+# -----------------------------------------------------------
+#   make build-gpu-container       # build the GPU Docker image locally
+#   make run-gpu-local             # run GPU container with CPU/GPU locally
+#   make push-gpu-container        # push to ECR (set ECR_REPO first)
+#   make deploy-gpu                # deploy GPU Lambda variant
 
 # ---------------------------------------------------------------------------
 # Configuration – override on the command line or in your environment
@@ -25,6 +32,13 @@ STACK_NAME   ?= msr-kb-service
 REGION       ?= us-east-1
 ENVIRONMENT  ?= prod
 S3_DEPLOY_BUCKET ?= # SAM deployment artifacts bucket (created on first deploy)
+
+# GPU container settings
+GPU_IMAGE_NAME  ?= msr-kb-gpu
+GPU_IMAGE_TAG   ?= latest
+ECR_REPO        ?= # e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/msr-kb-gpu
+EMBED_MODEL     ?= sentence-transformers/all-MiniLM-L6-v2
+LLM_MODEL       ?= TinyLlama/TinyLlama-1.1B-Chat-v1.0
 
 # ---------------------------------------------------------------------------
 # Default target
@@ -38,16 +52,36 @@ help:
 	@echo "MSR Knowledge Base Service – make targets"
 	@echo "========================================="
 	@echo ""
-	@echo "  make build          Build Lambda deployment package (Docker)"
-	@echo "  make build-native   Build without Docker (uses current Python)"
-	@echo "  make deploy-guided  First-time interactive deploy"
-	@echo "  make deploy         Deploy using saved samconfig.toml"
-	@echo "  make delete         Delete the CloudFormation stack"
+	@echo "  make build              Build Lambda deployment package (Docker)"
+	@echo "  make build-native       Build without Docker (uses current Python)"
+	@echo "  make deploy-guided      First-time interactive deploy"
+	@echo "  make deploy             Deploy using saved samconfig.toml"
+	@echo "  make delete             Delete the CloudFormation stack"
 	@echo ""
-	@echo "  make local-api      Start local HTTP server (port 3000)"
-	@echo "  make local-health   GET  http://127.0.0.1:3000/health"
-	@echo "  make local-query    POST http://127.0.0.1:3000/query"
-	@echo "  make local-update   POST http://127.0.0.1:3000/kb/update"
+	@echo "  make local-api          Start local HTTP server (port 3000)"
+	@echo "  make local-health       GET  http://127.0.0.1:3000/health"
+	@echo "  make local-query        POST http://127.0.0.1:3000/query"
+	@echo "  make local-update       POST http://127.0.0.1:3000/kb/update"
+	@echo ""
+	@echo "GPU container targets (sentence-transformers + HuggingFace LLM):"
+	@echo "  make build-gpu-container  Build GPU Docker image (Dockerfile.gpu)"
+	@echo "  make run-gpu-local        Run GPU container locally (CPU fallback)"
+	@echo "  make run-gpu-cuda         Run GPU container with NVIDIA GPU"
+	@echo "  make push-gpu-container   Push GPU image to ECR"
+	@echo "  make deploy-gpu           Deploy GPU Lambda variant via SAM"
+	@echo ""
+	@echo "  make test               Run all unit tests"
+	@echo "  make logs               Tail Lambda CloudWatch logs"
+	@echo "  make outputs            Show CloudFormation stack outputs (API URL etc.)"
+	@echo ""
+	@echo "Configuration:"
+	@echo "  STACK_NAME=$(STACK_NAME)"
+	@echo "  REGION=$(REGION)"
+	@echo "  ENVIRONMENT=$(ENVIRONMENT)"
+	@echo "  ECR_REPO=$(ECR_REPO)"
+	@echo "  EMBED_MODEL=$(EMBED_MODEL)"
+	@echo "  LLM_MODEL=$(LLM_MODEL)"
+	@echo ""
 	@echo ""
 	@echo "  make test           Run unit tests"
 	@echo "  make logs           Tail Lambda CloudWatch logs"
@@ -195,6 +229,102 @@ remote-update:
 		-d '{"source": "all"}' \
 		| python3 -m json.tool
 
+# GPU remote targets (hit /gpu/* routes)
+.PHONY: remote-gpu-health
+remote-gpu-health:
+	curl -s "$(_API_URL)/gpu/health" | python3 -m json.tool
+
+.PHONY: remote-gpu-query
+remote-gpu-query:
+	@test -n "$(QUESTION)" || (echo "Usage: make remote-gpu-query QUESTION='your question'" && exit 1)
+	curl -s -X POST "$(_API_URL)/gpu/query" \
+		-H "Content-Type: application/json" \
+		-H "X-Api-Key: $${MSR_API_KEY:-}" \
+		-d "{\"question\": \"$(QUESTION)\"}" \
+		| python3 -m json.tool
+
+# ---------------------------------------------------------------------------
+# GPU container targets
+# ---------------------------------------------------------------------------
+
+# Build the GPU-capable Docker image using Dockerfile.gpu
+.PHONY: build-gpu-container
+build-gpu-container:
+	docker build \
+		-f Dockerfile.gpu \
+		--build-arg EMBED_MODEL="$(EMBED_MODEL)" \
+		--build-arg LLM_MODEL="$(LLM_MODEL)" \
+		-t $(GPU_IMAGE_NAME):$(GPU_IMAGE_TAG) \
+		.
+
+# Run the GPU container locally on CPU (no --gpus flag)
+.PHONY: run-gpu-local
+run-gpu-local:
+	docker run --rm \
+		-p 9000:8080 \
+		-e MSR_USE_LOCAL_GPU=true \
+		-e MSR_API_KEY=$${MSR_API_KEY:-} \
+		-e MSR_OPENAI_API_KEY="" \
+		$(GPU_IMAGE_NAME):$(GPU_IMAGE_TAG)
+
+# Run the GPU container with NVIDIA GPU (requires nvidia-container-toolkit)
+.PHONY: run-gpu-cuda
+run-gpu-cuda:
+	docker run --rm --gpus all \
+		-p 9000:8080 \
+		-e MSR_USE_LOCAL_GPU=true \
+		-e MSR_API_KEY=$${MSR_API_KEY:-} \
+		$(GPU_IMAGE_NAME):$(GPU_IMAGE_TAG)
+
+# Test the locally running GPU container via Lambda RIE
+.PHONY: test-gpu-local-health
+test-gpu-local-health:
+	curl -s -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+		-d '{"rawPath":"/health","requestContext":{"http":{"method":"GET"}},"headers":{}}' \
+		| python3 -m json.tool
+
+.PHONY: test-gpu-local-query
+test-gpu-local-query:
+	@test -n "$(QUESTION)" || (echo "Usage: make test-gpu-local-query QUESTION='your question'" && exit 1)
+	curl -s -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+		-d "{\"rawPath\":\"/query\",\"requestContext\":{\"http\":{\"method\":\"POST\"}},\"body\":\"{\\\"question\\\":\\\"$(QUESTION)\\\"}\"}" \
+		| python3 -m json.tool
+
+# Authenticate with ECR and push the GPU image
+.PHONY: push-gpu-container
+push-gpu-container:
+	@test -n "$(ECR_REPO)" || (echo "Error: ECR_REPO is not set. Usage: make push-gpu-container ECR_REPO=<ecr-uri>" && exit 1)
+	aws ecr get-login-password --region $(REGION) \
+		| docker login --username AWS --password-stdin $$(echo $(ECR_REPO) | cut -d/ -f1)
+	docker tag $(GPU_IMAGE_NAME):$(GPU_IMAGE_TAG) $(ECR_REPO):$(GPU_IMAGE_TAG)
+	docker push $(ECR_REPO):$(GPU_IMAGE_TAG)
+
+# Create the ECR repository (idempotent)
+.PHONY: create-ecr-repo
+create-ecr-repo:
+	aws ecr create-repository \
+		--repository-name msr-kb-gpu \
+		--region $(REGION) \
+		--image-scanning-configuration scanOnPush=true \
+		--encryption-configuration encryptionType=AES256 \
+		2>/dev/null || echo "Repository already exists."
+
+# Deploy the GPU Lambda variant via SAM (requires image already pushed to ECR)
+.PHONY: deploy-gpu
+deploy-gpu: build
+	@test -n "$(ECR_REPO)" || (echo "Error: ECR_REPO is not set. Usage: make deploy-gpu ECR_REPO=<ecr-uri>" && exit 1)
+	sam deploy \
+		--stack-name $(STACK_NAME) \
+		--region $(REGION) \
+		--capabilities CAPABILITY_IAM \
+		--no-confirm-changeset \
+		--parameter-overrides \
+			UseLocalGPU=true \
+			GPUContainerImageUri=$(ECR_REPO):$(GPU_IMAGE_TAG) \
+			LocalEmbedModel="$(EMBED_MODEL)" \
+			LocalLLMModel="$(LLM_MODEL)" \
+			MsrApiKey=$${MSR_API_KEY:-}
+
 # ---------------------------------------------------------------------------
 # Testing
 # ---------------------------------------------------------------------------
@@ -214,3 +344,7 @@ test-lambda:
 .PHONY: logs
 logs:
 	sam logs -n MSRKBFunction --stack-name $(STACK_NAME) --region $(REGION) --tail
+
+.PHONY: logs-gpu
+logs-gpu:
+	sam logs -n MSRKBGPUFunction --stack-name $(STACK_NAME) --region $(REGION) --tail

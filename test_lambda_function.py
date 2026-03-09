@@ -194,6 +194,8 @@ class TestHealthEndpoint:
         body = json.loads(resp["body"])
         assert body["service"] == "msr-knowledge-base"
         assert body["status"] == "healthy"
+        assert "gpu" in body
+        assert "torch_available" in body["gpu"]
 
     def test_root_path_returns_health(self):
         import lambda_function as lf

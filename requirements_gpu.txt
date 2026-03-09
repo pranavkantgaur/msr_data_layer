@@ -1,0 +1,26 @@
+# MSR Knowledge Base Service – GPU container dependencies
+#
+# Installed inside the Docker GPU container (Dockerfile.gpu).
+# Used when MSR_USE_LOCAL_GPU=true for local embedding and generation.
+#
+# Core service dependencies
+numpy>=1.24.0
+boto3>=1.34.0
+
+# GPU-accelerated ML
+# PyTorch is installed separately in Dockerfile.gpu with the CUDA 12.1 wheel;
+# list it here so it is installed in local GPU dev environments too.
+# Install locally with CUDA:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements_gpu.txt
+torch>=2.1.0
+sentence-transformers>=2.6.0
+transformers>=4.40.0
+accelerate>=0.28.0
+
+# Optional: 8-bit quantisation (halves GPU VRAM usage for large models)
+# Requires a CUDA device.  Uncomment to include in the container image.
+# bitsandbytes>=0.43.0
+
+# Testing
+pytest>=8.0.0

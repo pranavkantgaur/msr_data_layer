@@ -57,10 +57,19 @@ MSR_OPENAI_BASE_URL    OpenAI-compatible API base URL
 MSR_OPENAI_MODEL       Chat model (default: gpt-4o-mini)
 MSR_EMBED_MODEL        Embedding model (default: text-embedding-3-small)
 MSR_DOCS_DIR           Local documents directory (default: /tmp/docs)
+MSR_USE_LOCAL_GPU      Set to ``true`` to use local GPU models for embeddings
+                       and response generation instead of the OpenAI API.
+                       Requires the GPU container image (see ``Dockerfile.gpu``).
+MSR_LOCAL_EMBED_MODEL  HuggingFace embedding model (default:
+                       ``sentence-transformers/all-MiniLM-L6-v2``)
+MSR_LOCAL_LLM_MODEL    HuggingFace generation model (default:
+                       ``TinyLlama/TinyLlama-1.1B-Chat-v1.0``)
+MSR_HF_CACHE_DIR       HuggingFace model cache (default: ``/tmp/hf_cache``)
 
 Deployment
 ----------
-See ``template.yaml`` (AWS SAM) and ``Makefile`` for build/deploy commands.
+See ``template.yaml`` (AWS SAM), ``Dockerfile.gpu`` (GPU container), and
+``Makefile`` for build/deploy commands.
 """
 
 from __future__ import annotations
@@ -263,7 +272,9 @@ def _parse_body(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 def _handle_health() -> dict[str, Any]:
     """``GET /health`` – service liveness check."""
     from msr_mcp_server import _get_current_state  # noqa: PLC0415
+    from msr_digital_twin_with_rag import _gpu_device, _TORCH_AVAILABLE  # noqa: PLC0415
     state = _get_current_state()
+    use_local_gpu = os.environ.get("MSR_USE_LOCAL_GPU", "").lower() in ("1", "true", "yes")
     return _response(200, {
         "service": "msr-knowledge-base",
         "version": "1.0.0",
@@ -271,6 +282,17 @@ def _handle_health() -> dict[str, Any]:
         "reactor_status": state.get("status", "UNKNOWN"),
         "kb_dir": _KB_LOCAL_DIR,
         "s3_bucket": _S3_BUCKET or "(not configured)",
+        "gpu": {
+            "torch_available": _TORCH_AVAILABLE,
+            "device": _gpu_device() if _TORCH_AVAILABLE else "cpu",
+            "local_gpu_mode": use_local_gpu,
+            "embed_model": os.environ.get(
+                "MSR_LOCAL_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+            ) if use_local_gpu else None,
+            "llm_model": os.environ.get(
+                "MSR_LOCAL_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+            ) if use_local_gpu else None,
+        },
     })
 
 
