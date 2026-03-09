@@ -1,15 +1,19 @@
 """
-MSR Digital Twin Client
+MSR Data Layer Client
 
-A lightweight Python client that communicates with the MSR MCP server
-over stdio (subprocess) and exposes a clean API for querying and
-controlling the digital twin.
+A lightweight Python client that communicates with the MSR Data Layer MCP
+server over stdio (subprocess) and exposes a clean API for reading plant
+sensor data and ingesting operational data into the knowledge base.
+
+This client connects to the data layer, which reads from an external plant
+data source (SCADA, historian, or digital twin API).  It does not include
+simulation or control-actuation capabilities.
 
 Example
 -------
-    from msr_digital_twin_client import MSRDigitalTwinClient
+    from msr_digital_twin_client import MSRDataLayerClient
 
-    with MSRDigitalTwinClient() as client:
+    with MSRDataLayerClient() as client:
         status = client.get_reactor_status()
         print(status)
         readings = client.get_all_sensor_readings()
@@ -27,9 +31,13 @@ class MCPError(Exception):
     """Raised when the MCP server returns an error response."""
 
 
-class MSRDigitalTwinClient:
+# Backward-compatible alias
+MSRDigitalTwinClient = None  # set at bottom of module
+
+
+class MSRDataLayerClient:
     """
-    Subprocess-based MCP client for the MSR digital twin.
+    Subprocess-based MCP client for the MSR Data Layer.
 
     Spawns ``msr_mcp_server_main.py`` as a child process and communicates
     over its stdin/stdout using the JSON-RPC 2.0 framing defined by the
@@ -46,7 +54,7 @@ class MSRDigitalTwinClient:
     # Context manager support
     # ------------------------------------------------------------------
 
-    def __enter__(self) -> "MSRDigitalTwinClient":
+    def __enter__(self) -> "MSRDataLayerClient":
         self.connect()
         return self
 
@@ -88,7 +96,7 @@ class MSRDigitalTwinClient:
         return result.get("tools", [])
 
     def get_reactor_status(self) -> dict[str, Any]:
-        """Fetch the current reactor status."""
+        """Fetch the current plant operational status."""
         return self._invoke_tool("get_reactor_status")
 
     def get_sensor_reading(self, sensor_name: str) -> dict[str, Any]:
@@ -105,34 +113,36 @@ class MSRDigitalTwinClient:
             "get_sensor_history", {"sensor_name": sensor_name, "last_n": last_n}
         )
 
-    def set_control_rod_position(self, position_pct: float) -> dict[str, Any]:
-        """Adjust control rod insertion depth (0-100 %)."""
-        return self._invoke_tool(
-            "set_control_rod_position", {"position_pct": position_pct}
-        )
-
     def get_active_alarms(self) -> dict[str, Any]:
         """Return all active alarms."""
         return self._invoke_tool("get_active_alarms")
 
-    def acknowledge_alarm(self, alarm_id: str) -> dict[str, Any]:
-        """Acknowledge an alarm by ID."""
-        return self._invoke_tool("acknowledge_alarm", {"alarm_id": alarm_id})
+    def get_data_source_info(self) -> dict[str, Any]:
+        """Return data source configuration and connectivity status."""
+        return self._invoke_tool("get_data_source_info")
 
-    def run_thermal_simulation(
+    def ingest_plant_data(
         self,
-        power_mw: float,
-        inlet_temp_c: float,
-        flow_rate_kg_s: float,
+        content: str,
+        data_type: str = "operational_data",
+        source_id: str = "",
     ) -> dict[str, Any]:
-        """Run the steady-state thermal-hydraulic simulation."""
+        """
+        Ingest plant operational data into the knowledge base.
+
+        Parameters
+        ----------
+        content : str
+            Plain text or JSON-encoded plant data record.
+        data_type : str
+            Category: ``"sensor_snapshot"``, ``"event_log"``,
+            ``"maintenance_report"``, or ``"operational_data"``.
+        source_id : str
+            Optional unique identifier for de-duplication.
+        """
         return self._invoke_tool(
-            "run_thermal_simulation",
-            {
-                "power_mw": power_mw,
-                "inlet_temp_c": inlet_temp_c,
-                "flow_rate_kg_s": flow_rate_kg_s,
-            },
+            "ingest_plant_data",
+            {"content": content, "data_type": data_type, "source_id": source_id},
         )
 
     # ------------------------------------------------------------------
@@ -179,17 +189,25 @@ class MSRDigitalTwinClient:
 
 
 # ---------------------------------------------------------------------------
+# Backward-compatible alias
+# ---------------------------------------------------------------------------
+
+# Code written against the old "MSRDigitalTwinClient" name continues to work.
+MSRDigitalTwinClient = MSRDataLayerClient  # type: ignore[assignment,misc]
+
+
+# ---------------------------------------------------------------------------
 # Quick demo
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("MSR Digital Twin Client – quick demo\n")
-    with MSRDigitalTwinClient() as client:
+    print("MSR Data Layer Client – quick demo\n")
+    with MSRDataLayerClient() as client:
         print("Available tools:")
         for tool in client.list_tools():
             print(f"  • {tool['name']} – {tool['description']}")
 
-        print("\nReactor Status:")
+        print("\nPlant Status:")
         status = client.get_reactor_status()
         for key, value in status.items():
             print(f"  {key}: {value}")
@@ -198,7 +216,7 @@ if __name__ == "__main__":
         reading = client.get_sensor_reading("core_temperature_c")
         print(f"  {reading['sensor']}: {reading['value']} {reading['unit']}")
 
-        print("\nThermal simulation (100 MW, 650 °C inlet, 250 kg/s):")
-        sim = client.run_thermal_simulation(100.0, 650.0, 250.0)
-        for key, value in sim.items():
+        print("\nData source info:")
+        info = client.get_data_source_info()
+        for key, value in info.items():
             print(f"  {key}: {value}")

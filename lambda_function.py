@@ -1,13 +1,13 @@
 """
 MSR Knowledge Base Service – AWS Lambda Handler
 
-Exposes the MSR digital twin MCP server and RAG knowledge base as an HTTPS
+Exposes the MSR data layer MCP server and RAG knowledge base as an HTTPS
 service via AWS Lambda + API Gateway (HTTP API v2).  A single Lambda function
-handles all three concerns:
+handles all four concerns:
 
 1. **MCP endpoint** (``POST /mcp``) – full JSON-RPC 2.0 / MCP protocol so any
    MCP-capable host (Claude, GitHub Copilot, custom agent) can talk to the
-   reactor digital twin tools over HTTPS instead of stdio.
+   data layer tools over HTTPS instead of stdio.
 
 2. **Query endpoint** (``POST /query``) – simple REST wrapper around the RAG
    pipeline so agents or operators can send a plain-text question and receive
@@ -18,7 +18,11 @@ handles all three concerns:
    Can also be invoked on a schedule via Amazon EventBridge (the same function
    is the target; see ``template.yaml``).
 
-4. **Health endpoint** (``GET /health``) – returns 200 with service metadata
+4. **Plant data ingestion endpoint** (``POST /data/ingest``) – accepts plant
+   operational data (sensor snapshots, event logs, maintenance reports) from
+   operators or agents and ingests it into the RAG knowledge base.
+
+5. **Health endpoint** (``GET /health``) – returns 200 with service metadata
    for load-balancer checks and uptime monitoring.
 
 Knowledge Base Persistence
@@ -28,8 +32,8 @@ Lambda execution environments are ephemeral.  The KB files (``chunks.json``,
 synced to an **S3 bucket** so they survive across invocations:
 
 * On cold start the function downloads all KB files from S3 to ``/tmp/kb_store``.
-* After every mutating operation (``/kb/update`` or scheduled refresh) the
-  updated files are uploaded back to S3.
+* After every mutating operation (``/kb/update``, ``/data/ingest``, or
+  scheduled refresh) the updated files are uploaded back to S3.
 
 S3 sync is **optional** – if ``MSR_KB_S3_BUCKET`` is not set the function
 works entirely in ``/tmp`` (KB is rebuilt on every cold start from ``MSR_DOCS_DIR``
@@ -52,6 +56,8 @@ Environment Variables
 MSR_KB_S3_BUCKET       S3 bucket name for KB persistence (no sync if unset)
 MSR_KB_S3_PREFIX       S3 key prefix (default: ``kb/``)
 MSR_API_KEY            Shared API key for request authentication (optional)
+MSR_PLANT_DATA_URL     URL of external plant data REST API (optional; when
+                       unset, the development stub is used for sensor reads)
 MSR_OPENAI_API_KEY     OpenAI key for LLM + embeddings
 MSR_OPENAI_BASE_URL    OpenAI-compatible API base URL
 MSR_OPENAI_MODEL       Chat model (default: gpt-4o-mini)
@@ -114,6 +120,7 @@ _KB_FILES = [
     "tfidf.json",
     "archive_state.json",
     "openalex_state.json",
+    "plant_data_state.json",
 ]
 
 # ---------------------------------------------------------------------------
@@ -271,15 +278,18 @@ def _parse_body(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 
 def _handle_health() -> dict[str, Any]:
     """``GET /health`` – service liveness check."""
-    from msr_mcp_server import _get_current_state  # noqa: PLC0415
+    from msr_mcp_server import _get_current_state, get_data_source_info  # noqa: PLC0415
     from msr_digital_twin_with_rag import _gpu_device, _TORCH_AVAILABLE  # noqa: PLC0415
     state = _get_current_state()
+    ds_info = get_data_source_info()
+    # Include current plant status in the data_source info block
+    ds_info["plant_status"] = state.get("status", "UNKNOWN")
     use_local_gpu = os.environ.get("MSR_USE_LOCAL_GPU", "").lower() in ("1", "true", "yes")
     return _response(200, {
         "service": "msr-knowledge-base",
         "version": "1.0.0",
         "status": "healthy",
-        "reactor_status": state.get("status", "UNKNOWN"),
+        "data_source": ds_info,
         "kb_dir": _KB_LOCAL_DIR,
         "s3_bucket": _S3_BUCKET or "(not configured)",
         "gpu": {
@@ -350,6 +360,64 @@ def _handle_query(body: dict[str, Any]) -> dict[str, Any]:
         "question": question,
         "answer": answer,
         "top_k": top_k,
+    })
+
+
+def _handle_plant_data_ingest(body: dict[str, Any]) -> dict[str, Any]:
+    """
+    ``POST /data/ingest`` – ingest plant operational data into the KB.
+
+    Request body::
+
+        {
+          "content":   "Core temp 702°C at 14:32 UTC, flow 248 kg/s",
+          "data_type": "sensor_snapshot",  // optional, default "operational_data"
+          "source_id": "shift-log-2024-01-15-1432"  // optional, auto-generated if absent
+        }
+
+    ``content`` can also be a JSON-encoded sensor snapshot or event log.
+
+    Response::
+
+        {
+          "source_id":    "shift-log-2024-01-15-1432",
+          "data_type":    "sensor_snapshot",
+          "chunks_added": 2
+        }
+    """
+    content = (body.get("content") or "").strip()
+    if not content:
+        return _error(400, "Request body must include a non-empty 'content' field.")
+
+    data_type = (body.get("data_type") or "operational_data").strip()
+    valid_types = {"sensor_snapshot", "event_log", "maintenance_report", "operational_data"}
+    if data_type not in valid_types:
+        return _error(
+            400,
+            f"data_type must be one of: {', '.join(sorted(valid_types))}."
+        )
+
+    source_id = (body.get("source_id") or "").strip()
+    if not source_id:
+        import time  # noqa: PLC0415
+        source_id = f"{data_type}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+
+    rag = _get_rag()
+    try:
+        from msr_kb_sources import PlantDataLoader  # noqa: PLC0415
+        loader = PlantDataLoader()
+        chunks_added = loader.ingest_text(rag, content, source_id, data_type=data_type)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Plant data ingestion failed")
+        return _error(500, f"Ingestion failed: {exc}")
+
+    # Persist updated KB back to S3
+    sync_kb_to_s3()
+
+    return _response(200, {
+        "source_id": source_id,
+        "data_type": data_type,
+        "chunks_added": chunks_added,
     })
 
 
@@ -462,6 +530,10 @@ def _route_http(event: dict[str, Any]) -> dict[str, Any]:
     # KB update endpoint
     if path == "/kb/update" and method == "POST":
         return _handle_kb_update(parsed_body)
+
+    # Plant data ingestion endpoint
+    if path == "/data/ingest" and method == "POST":
+        return _handle_plant_data_ingest(parsed_body)
 
     return _error(404, f"Not found: {method} {path}")
 

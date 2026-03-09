@@ -1,9 +1,11 @@
 """
-MSR Digital Twin with Enhanced RAG (Retrieval-Augmented Generation)
+MSR Data Layer – Enhanced RAG (Retrieval-Augmented Generation) Pipeline
 
-Combines the MSR digital twin's live sensor data (via the MCP client) with
-an enhanced multi-step RAG pipeline inspired by the open-notebook project
-(https://github.com/lfnovo/open-notebook).
+Provides a knowledge base and multi-step RAG pipeline for the MSR data layer,
+supporting design, construction, and operations of Molten Salt Reactor systems.
+
+The pipeline reads live plant data via the MCP data layer client and combines
+it with reference documents to answer operator and agent queries.
 
 Architecture
 ------------
@@ -11,6 +13,7 @@ Architecture
 
 1. Sentence-aware text chunking with configurable overlap.
 2. Dense vector embeddings via:
+   - Local GPU models via sentence-transformers (when ``MSR_USE_LOCAL_GPU=true``), or
    - OpenAI-compatible Embeddings API (when ``MSR_OPENAI_API_KEY`` is set), or
    - Random-projection engine (numpy-based, zero external dependencies).
 3. Source insights – LLM-generated summary, topics, and key facts for each
@@ -28,7 +31,7 @@ Architecture
 3. *Sub-answer extraction* – the LLM distils each search result into a
    focused partial answer.
 4. *Final synthesis* – the LLM combines all partial answers and live
-   reactor data into a comprehensive final answer.
+   plant data into a comprehensive final answer.
 
 Environment Variables
 ---------------------
@@ -48,11 +51,13 @@ MSR_LOCAL_LLM_MODEL   HuggingFace model ID for local text generation
                       (default: TinyLlama/TinyLlama-1.1B-Chat-v1.0)
 MSR_HF_CACHE_DIR      HuggingFace model cache directory
                       (default: /tmp/hf_cache)
+MSR_PLANT_DATA_URL    URL of external plant data REST API (optional; when
+                      unset, the development stub is used for live data reads)
 
 Document Sources
 ----------------
 In addition to local files in ``MSR_DOCS_DIR``, the knowledge base can be
-populated from two external sources (see ``msr_kb_sources.py``):
+populated from three external sources (see ``msr_kb_sources.py``):
 
 * **Static source** – ``pranavkantgaur/msr-archive`` GitHub repository:
   OCR transcriptions of historical ORNL Molten Salt Reactor reports.
@@ -63,7 +68,11 @@ populated from two external sources (see ``msr_kb_sources.py``):
   TMSR-LF1 query (SINAP, China).
   Fetched via :meth:`MSRDigitalTwinRAG.update_openalex`.
 
-Both sources maintain state files so only new documents are re-ingested.
+* **Plant operational data** – real-time data pushed by operators or agents
+  via :meth:`MSRDigitalTwinRAG.add_document` or the ``/data/ingest`` endpoint.
+  Includes sensor snapshots, event logs, and maintenance reports.
+
+All sources maintain state files so only new documents are re-ingested.
 """
 
 from __future__ import annotations
@@ -1276,11 +1285,12 @@ class MSRDigitalTwinRAG:
             insight_block = "\n## Knowledge Base Overview\n" + "\n".join(lines)
 
         prompt = textwrap.dedent(f"""\
-            You are an expert assistant for a Molten Salt Reactor (MSR) digital twin.
-            Synthesise the following research findings and live reactor data to
-            answer the operator's question comprehensively.
+            You are an expert assistant for Molten Salt Reactor (MSR) design,
+            construction, and operations.
+            Synthesise the following research findings and live plant data to
+            answer the question comprehensively.
 
-            ## Live Reactor Data
+            ## Live Plant Data
             {reactor_context}
             {insight_block}
 
@@ -1313,7 +1323,7 @@ class MSRDigitalTwinRAG:
             with MSRDigitalTwinClient() as client:
                 status = client.get_reactor_status()
                 alarms = client.get_active_alarms()
-            lines = ["Current reactor state:"]
+            lines = ["Current plant state:"]
             for key, value in status.items():
                 lines.append(f"  {key}: {value}")
             if alarms.get("alarm_count", 0) > 0:
@@ -1327,7 +1337,7 @@ class MSRDigitalTwinRAG:
                 lines.append("\nNo active alarms.")
             return "\n".join(lines)
         except Exception as exc:  # noqa: BLE001
-            return f"[Could not fetch reactor state: {exc}]"
+            return f"[Could not fetch plant state: {exc}]"
 
     @staticmethod
     def _format_chunks(chunks: list[dict[str, Any]]) -> str:
@@ -1348,10 +1358,11 @@ class MSRDigitalTwinRAG:
         question: str, doc_context: str, reactor_context: str
     ) -> str:
         return textwrap.dedent(f"""\
-            You are an expert assistant for a Molten Salt Reactor (MSR) digital twin.
-            Use the following information to answer the operator's question.
+            You are an expert assistant for Molten Salt Reactor (MSR) design,
+            construction, and operations.
+            Use the following live plant data and reference documents to answer the question.
 
-            ## Live Reactor Data
+            ## Live Plant Data
             {reactor_context}
 
             ## Reference Documents

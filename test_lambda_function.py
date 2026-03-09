@@ -196,6 +196,8 @@ class TestHealthEndpoint:
         assert body["status"] == "healthy"
         assert "gpu" in body
         assert "torch_available" in body["gpu"]
+        # data_source info included (replaces old reactor_status field)
+        assert "data_source" in body
 
     def test_root_path_returns_health(self):
         import lambda_function as lf
@@ -495,6 +497,113 @@ class TestS3Sync:
              patch("lambda_function._s3_client", return_value=mock_s3), \
              patch("lambda_function._KB_LOCAL_DIR", str(tmp_path / "kb")):
             lf.sync_kb_from_s3()   # should not raise
+
+
+# ---------------------------------------------------------------------------
+# /data/ingest endpoint
+# ---------------------------------------------------------------------------
+
+class TestPlantDataIngest:
+    """Tests for the POST /data/ingest plant operational data endpoint."""
+
+    def test_ingest_returns_200(self, mock_rag, tmp_path):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        mock_rag.add_document.return_value = 2
+        event = _apigw_event(
+            "POST", "/data/ingest",
+            body={"content": "Core temperature 702°C at 14:32 UTC"},
+        )
+        from unittest.mock import patch, MagicMock
+        mock_loader = MagicMock()
+        mock_loader.ingest_text.return_value = 2
+        mock_plant_module = MagicMock()
+        mock_plant_module.PlantDataLoader.return_value = mock_loader
+        with patch.dict("sys.modules", {"msr_kb_sources": mock_plant_module}):
+            resp = lf.lambda_handler(event, None)
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["chunks_added"] == 2
+        assert "source_id" in body
+        assert body["data_type"] == "operational_data"
+
+    def test_ingest_with_explicit_source_id(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        from unittest.mock import patch, MagicMock
+        mock_loader = MagicMock()
+        mock_loader.ingest_text.return_value = 1
+        mock_plant_module = MagicMock()
+        mock_plant_module.PlantDataLoader.return_value = mock_loader
+        event = _apigw_event(
+            "POST", "/data/ingest",
+            body={
+                "content": "HX-1 inspection complete. No fouling.",
+                "data_type": "maintenance_report",
+                "source_id": "maint-hx1-20240115",
+            },
+        )
+        with patch.dict("sys.modules", {"msr_kb_sources": mock_plant_module}):
+            resp = lf.lambda_handler(event, None)
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["source_id"] == "maint-hx1-20240115"
+        assert body["data_type"] == "maintenance_report"
+
+    def test_ingest_missing_content_returns_400(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        event = _apigw_event("POST", "/data/ingest", body={"data_type": "event_log"})
+        resp = lf.lambda_handler(event, None)
+        assert resp["statusCode"] == 400
+
+    def test_ingest_invalid_data_type_returns_400(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        event = _apigw_event(
+            "POST", "/data/ingest",
+            body={"content": "some data", "data_type": "invalid_type"},
+        )
+        resp = lf.lambda_handler(event, None)
+        assert resp["statusCode"] == 400
+
+    def test_ingest_all_valid_data_types(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        from unittest.mock import patch, MagicMock
+        valid_types = [
+            "sensor_snapshot", "event_log",
+            "maintenance_report", "operational_data"
+        ]
+        for data_type in valid_types:
+            mock_loader = MagicMock()
+            mock_loader.ingest_text.return_value = 1
+            mock_plant_module = MagicMock()
+            mock_plant_module.PlantDataLoader.return_value = mock_loader
+            event = _apigw_event(
+                "POST", "/data/ingest",
+                body={"content": f"{data_type} content", "data_type": data_type},
+            )
+            with patch.dict("sys.modules", {"msr_kb_sources": mock_plant_module}):
+                resp = lf.lambda_handler(event, None)
+            assert resp["statusCode"] == 200, f"Failed for data_type={data_type}"
+
+    def test_ingest_syncs_to_s3(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        from unittest.mock import patch, MagicMock
+        mock_loader = MagicMock()
+        mock_loader.ingest_text.return_value = 1
+        mock_plant_module = MagicMock()
+        mock_plant_module.PlantDataLoader.return_value = mock_loader
+        event = _apigw_event(
+            "POST", "/data/ingest",
+            body={"content": "some operational data"},
+        )
+        with patch.dict("sys.modules", {"msr_kb_sources": mock_plant_module}), \
+             patch.object(lf, "sync_kb_to_s3") as mock_sync:
+            lf.lambda_handler(event, None)
+        mock_sync.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

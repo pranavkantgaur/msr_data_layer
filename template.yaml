@@ -69,6 +69,15 @@ Parameters:
       EventBridge schedule expression for periodic KB updates.
       Examples: "rate(1 day)", "cron(0 2 * * ? *)" (daily at 02:00 UTC).
 
+  PlantDataUrl:
+    Type: String
+    Default: ""
+    Description: >
+      URL of the external plant data REST API (SCADA, historian, or digital
+      twin API).  When a GET request to this URL returns a JSON object of
+      sensor key/value pairs, it will be used for live data reads.
+      Leave blank to use the development stub.
+
   UseLocalGPU:
     Type: String
     Default: "false"
@@ -136,6 +145,7 @@ Globals:
         MSR_OPENALEX_EMAIL: !Ref OpenAlexEmail
         MSR_GITHUB_TOKEN: !Ref GithubToken
         MSR_OPENALEX_MAX_RESULTS: !Ref OpenAlexMaxResults
+        MSR_PLANT_DATA_URL: !Ref PlantDataUrl
         POWERTOOLS_SERVICE_NAME: msr-kb-service
         LOG_LEVEL: INFO
 
@@ -242,6 +252,12 @@ Resources:
             ApiId: !Ref MSRHttpApi
             Path: /kb/update
             Method: POST
+        PlantDataIngestEndpoint:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /data/ingest
+            Method: POST
         # ── Scheduled KB refresh (EventBridge) ──────────────────────────
         ScheduledKBUpdate:
           Type: Schedule
@@ -345,6 +361,12 @@ Resources:
             ApiId: !Ref MSRHttpApi
             Path: /gpu/kb/update
             Method: POST
+        PlantDataIngestEndpointGPU:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /gpu/data/ingest
+            Method: POST
         ScheduledKBUpdateGPU:
           Type: Schedule
           Properties:
@@ -396,6 +418,10 @@ Outputs:
   KBUpdateEndpoint:
     Description: Knowledge-base update endpoint
     Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/kb/update"
+
+  PlantDataIngestEndpoint:
+    Description: Plant operational data ingestion endpoint
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/data/ingest"
 
   KBStoreBucketName:
     Description: S3 bucket storing the persistent knowledge base

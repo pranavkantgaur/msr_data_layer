@@ -1,7 +1,7 @@
 """
 MSR Knowledge-Base Source Loaders
 
-Two document sources feed the MSRDigitalTwinRAG knowledge base:
+Three document sources feed the MSR data layer knowledge base:
 
 1. **Static source** – ``pranavkantgaur/msr-archive`` GitHub repository
    OCR text files from the ``ocr/`` directory (transcribed ORNL Molten Salt
@@ -13,7 +13,13 @@ Two document sources feed the MSRDigitalTwinRAG knowledge base:
    periodically.  A second targeted query focuses on TMSR-LF1 experimental
    data from the TMSR group at SINAP (Shanghai Institute of Applied Physics).
 
-Both loaders maintain a JSON state file in ``MSR_KB_DIR`` (default
+3. **Plant operational data** – :class:`PlantDataLoader`
+   Accepts real-time plant data pushed by operators or agents: sensor
+   snapshots, event logs, and maintenance/inspection reports.  This enables
+   the knowledge base to accumulate operational history so future RAG queries
+   can incorporate real plant experience alongside reference documents.
+
+All loaders maintain a JSON state file in ``MSR_KB_DIR`` (default
 ``./kb_store``) so that documents already ingested are never processed
 twice.  Re-running the updater therefore only adds truly new content.
 
@@ -36,15 +42,20 @@ CLI Usage
     python msr_kb_sources.py --update-openalex
     python msr_kb_sources.py --update-all
     python msr_kb_sources.py --status
+    python msr_kb_sources.py --ingest-plant-data --content "..." --data-type sensor_snapshot
 
 Python Usage
 ------------
     from msr_digital_twin_with_rag import MSRDigitalTwinRAG
-    from msr_kb_sources import KBSourceManager
+    from msr_kb_sources import KBSourceManager, PlantDataLoader
 
     rag = MSRDigitalTwinRAG()
     mgr = KBSourceManager(rag)
     mgr.update_all()
+
+    # Ingest plant operational data directly
+    loader = PlantDataLoader()
+    loader.ingest_text(rag, "Core temperature spike to 712°C at 14:32 UTC", "event-001")
 """
 
 from __future__ import annotations
@@ -611,12 +622,209 @@ class OpenAlexLoader:
 
 
 # ---------------------------------------------------------------------------
-# KBSourceManager – orchestrates both loaders
+# Plant operational data loader (real-time / live-plant source)
+# ---------------------------------------------------------------------------
+
+class PlantDataLoader:
+    """
+    Ingests plant real-time operational data into the MSR knowledge base.
+
+    Accepts three categories of input:
+
+    ``sensor_snapshot``
+        A JSON-encoded list of sensor readings or a single dict snapshot with
+        ``{sensor, value, unit, timestamp}`` records, e.g. readings exported
+        from a SCADA historian.
+
+    ``event_log``
+        Text or JSON-encoded operational events (alarms cleared, set-point
+        changes, transient summaries, shift handover notes).
+
+    ``maintenance_report``
+        Unstructured text: inspection reports, maintenance logs, corrective
+        action records.
+
+    ``operational_data`` *(default)*
+        Any other plant operational text record.
+
+    All ingested records are tracked in ``plant_data_state.json`` (inside
+    ``MSR_KB_DIR``) so the same ``source_id`` is never ingested twice.
+
+    Parameters
+    ----------
+    kb_dir : str | Path | None
+        Knowledge-base directory.  Defaults to the ``MSR_KB_DIR`` env var
+        or ``./kb_store``.
+
+    Example
+    -------
+    ::
+
+        from msr_digital_twin_with_rag import MSRDigitalTwinRAG
+        from msr_kb_sources import PlantDataLoader
+
+        rag = MSRDigitalTwinRAG()
+        loader = PlantDataLoader()
+
+        # Ingest a maintenance report
+        loader.ingest_text(
+            rag,
+            "2024-01-15: Inspected heat exchanger HX-1. No fouling detected.",
+            source_id="maint-hx1-20240115",
+            data_type="maintenance_report",
+        )
+
+        # Ingest a sensor snapshot
+        snapshot = [
+            {"timestamp": "2024-01-15T14:00:00Z", "sensor": "core_temperature_c",
+             "value": 702.1, "unit": "°C"},
+            {"timestamp": "2024-01-15T14:00:00Z", "sensor": "reactor_power_mw",
+             "value": 99.8, "unit": "MW"},
+        ]
+        loader.ingest_sensor_snapshot(rag, snapshot, source_id="snapshot-20240115T1400Z")
+    """
+
+    STATE_FILE = "plant_data_state.json"
+
+    _VALID_DATA_TYPES = frozenset(
+        {"sensor_snapshot", "event_log", "maintenance_report", "operational_data"}
+    )
+
+    def __init__(self, kb_dir: str | Path | None = None) -> None:
+        self._kb_dir = Path(kb_dir or os.environ.get("MSR_KB_DIR", "./kb_store"))
+        self._state_path = self._kb_dir / self.STATE_FILE
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def ingest_text(
+        self,
+        rag: Any,
+        text: str,
+        source_id: str,
+        data_type: str = "operational_data",
+    ) -> int:
+        """
+        Ingest *text* into the knowledge base with the given *source_id*.
+
+        Parameters
+        ----------
+        rag:
+            An initialised :class:`~msr_digital_twin_with_rag.MSRDigitalTwinRAG`
+            instance.
+        text : str
+            The content to ingest.
+        source_id : str
+            Unique identifier for this record.  Re-ingestion of the same ID
+            is a no-op.
+        data_type : str
+            One of ``"sensor_snapshot"``, ``"event_log"``,
+            ``"maintenance_report"``, ``"operational_data"``.
+
+        Returns
+        -------
+        int
+            Number of KB chunks added (0 if already ingested).
+        """
+        if not text or not text.strip():
+            return 0
+        if data_type not in self._VALID_DATA_TYPES:
+            data_type = "operational_data"
+
+        state = _load_state(self._state_path)
+        ingested: set[str] = set(state.get("ingested_ids", []))
+        if source_id in ingested:
+            return 0
+
+        source_label = f"plant:{data_type}:{source_id}"
+        n = rag.add_document(text, source=source_label)
+
+        ingested.add(source_id)
+        state["ingested_ids"] = sorted(ingested)
+        state["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        state["total_ingested"] = len(ingested)
+        _save_state(self._state_path, state)
+
+        print(f"[PlantData] + {source_label} ({n} chunks)")
+        return n
+
+    def ingest_sensor_snapshot(
+        self,
+        rag: Any,
+        snapshot: Any,
+        source_id: str,
+    ) -> int:
+        """
+        Format a sensor snapshot and ingest it.
+
+        Parameters
+        ----------
+        snapshot : list | dict
+            Either a list of ``{sensor, value, unit, timestamp}`` dicts or a
+            single ``{sensor: value, ...}`` dict.  JSON strings are accepted.
+        source_id : str
+            Unique identifier for this snapshot.
+        """
+        if isinstance(snapshot, str):
+            try:
+                snapshot = json.loads(snapshot)
+            except (json.JSONDecodeError, ValueError):
+                pass  # fall through to format as-is
+        text = self._format_snapshot(snapshot)
+        return self.ingest_text(rag, text, source_id, data_type="sensor_snapshot")
+
+    def status(self) -> dict[str, Any]:
+        """Return loader state summary."""
+        state = _load_state(self._state_path)
+        return {
+            "source": "Plant operational data (real-time ingestion)",
+            "total_ingested": state.get("total_ingested", 0),
+            "last_run": state.get("last_run", "never"),
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_snapshot(snapshot: Any) -> str:
+        """Convert a sensor snapshot to a human-readable text string."""
+        if isinstance(snapshot, list):
+            lines = ["Plant Sensor Readings:"]
+            for rec in snapshot:
+                if not isinstance(rec, dict):
+                    lines.append(f"  {rec}")
+                    continue
+                ts = rec.get("timestamp", "")
+                sensor = rec.get("sensor", rec.get("name", ""))
+                value = rec.get("value", "")
+                unit = rec.get("unit", "")
+                prefix = f"[{ts}] " if ts else ""
+                suffix = f" {unit}" if unit else ""
+                lines.append(f"  {prefix}{sensor}: {value}{suffix}".strip())
+            return "\n".join(lines)
+        elif isinstance(snapshot, dict):
+            lines = ["Plant Sensor Snapshot:"]
+            ts = snapshot.get("timestamp", "")
+            if ts:
+                lines.append(f"  Timestamp: {ts}")
+            for k, v in snapshot.items():
+                if k == "timestamp":
+                    continue
+                lines.append(f"  {k}: {v}")
+            return "\n".join(lines)
+        else:
+            return str(snapshot)
+
+
+# ---------------------------------------------------------------------------
+# KBSourceManager – orchestrates all loaders
 # ---------------------------------------------------------------------------
 
 class KBSourceManager:
     """
-    Coordinates the two knowledge-base source loaders.
+    Coordinates all knowledge-base source loaders.
 
     Parameters
     ----------
@@ -636,7 +844,7 @@ class KBSourceManager:
 
         rag = MSRDigitalTwinRAG()
         mgr = KBSourceManager(rag)
-        mgr.update_all()          # ingest new docs from both sources
+        mgr.update_all()          # ingest new docs from archive + OpenAlex
     """
 
     def __init__(
@@ -648,6 +856,7 @@ class KBSourceManager:
         _kb = kb_dir or os.environ.get("MSR_KB_DIR", "./kb_store")
         self._archive = MSRArchiveLoader(kb_dir=_kb)
         self._openalex = OpenAlexLoader(kb_dir=_kb)
+        self._plant = PlantDataLoader(kb_dir=_kb)
 
     def update_archive(self, max_docs: int = 0) -> int:
         """Ingest new OCR files from msr-archive. Returns docs added."""
@@ -657,13 +866,26 @@ class KBSourceManager:
         """Ingest new OpenAlex papers. Returns docs added."""
         return self._openalex.ingest(self._rag, max_docs=max_docs)
 
+    def ingest_plant_data(
+        self,
+        text: str,
+        source_id: str,
+        data_type: str = "operational_data",
+    ) -> int:
+        """
+        Ingest plant operational data into the knowledge base.
+
+        Returns the number of KB chunks added (0 if already ingested).
+        """
+        return self._plant.ingest_text(self._rag, text, source_id, data_type=data_type)
+
     def update_all(
         self,
         max_archive_docs: int = 0,
         max_openalex_docs: int | None = None,
     ) -> dict[str, int]:
         """
-        Run both loaders and return counts of newly added documents.
+        Run archive + OpenAlex loaders and return counts of newly added documents.
 
         Returns
         -------
@@ -675,12 +897,11 @@ class KBSourceManager:
         return {"archive": archive_added, "openalex": openalex_added}
 
     def status(self) -> None:
-        """Print a summary of both loaders' state."""
-        archive_st = self._archive.status()
-        openalex_st = self._openalex.status()
+        """Print a summary of all loaders' state."""
+        sources = [self._archive.status(), self._openalex.status(), self._plant.status()]
         print("\n=== MSR Knowledge-Base Source Status ===")
-        for st in (archive_st, openalex_st):
-            print(f"  Source : {st['source']}")
+        for st in sources:
+            print(f"  Source  : {st['source']}")
             print(f"  Ingested: {st['total_ingested']}")
             print(f"  Last run: {st['last_run']}")
             print()
@@ -721,18 +942,48 @@ def _cli_main(argv: list[str] | None = None) -> None:
     group.add_argument(
         "--update-all",
         action="store_true",
-        help="Run both loaders (equivalent to --update-archive + --update-openalex)",
+        help="Run archive + OpenAlex loaders",
     )
     group.add_argument(
         "--status",
         action="store_true",
-        help="Show current state of both loaders without fetching anything",
+        help="Show current state of all loaders without fetching anything",
+    )
+    group.add_argument(
+        "--ingest-plant-data",
+        action="store_true",
+        help="Ingest plant operational data into the knowledge base",
     )
     parser.add_argument(
         "--max-docs",
         type=int,
         default=0,
         help="Override max documents per run (0 = no limit / use env default)",
+    )
+    parser.add_argument(
+        "--content",
+        type=str,
+        default="",
+        help="Plant data content to ingest (used with --ingest-plant-data)",
+    )
+    parser.add_argument(
+        "--content-file",
+        type=str,
+        default="",
+        help="Path to file containing plant data content (used with --ingest-plant-data)",
+    )
+    parser.add_argument(
+        "--data-type",
+        type=str,
+        default="operational_data",
+        choices=["sensor_snapshot", "event_log", "maintenance_report", "operational_data"],
+        help="Category of plant data (default: operational_data)",
+    )
+    parser.add_argument(
+        "--source-id",
+        type=str,
+        default="",
+        help="Unique ID for the plant data record (auto-generated if omitted)",
     )
 
     args = parser.parse_args(argv)
@@ -760,6 +1011,16 @@ def _cli_main(argv: list[str] | None = None) -> None:
             f"\n[KB] Update complete: archive +{counts['archive']}, "
             f"openalex +{counts['openalex']}"
         )
+    elif args.ingest_plant_data:
+        content = args.content
+        if not content and args.content_file:
+            content = Path(args.content_file).read_text(encoding="utf-8")
+        if not content:
+            print("Error: provide --content or --content-file with --ingest-plant-data.", file=sys.stderr)
+            raise SystemExit(1)
+        source_id = args.source_id or f"{args.data_type}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+        n = mgr.ingest_plant_data(content, source_id, data_type=args.data_type)
+        print(f"[KB] Plant data ingested: {n} chunk(s) added from source '{source_id}'.")
 
 
 if __name__ == "__main__":

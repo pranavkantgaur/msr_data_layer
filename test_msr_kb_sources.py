@@ -5,7 +5,8 @@ Tests cover:
 - reconstruct_abstract (inverted-index → plain text)
 - MSRArchiveLoader (list, fetch, ingest, state persistence)
 - OpenAlexLoader (work formatting, ingestion, deduplication, state)
-- KBSourceManager (orchestration, update_all)
+- PlantDataLoader (ingest text, sensor snapshots, deduplication, state)
+- KBSourceManager (orchestration, update_all, ingest_plant_data)
 - Integration: load_msr_archive / update_openalex on MSRDigitalTwinRAG
 """
 
@@ -545,3 +546,148 @@ def test_rag_update_openalex_method(tmp_path, monkeypatch):
     assert n >= 1
     results = rag._kb.search("TMSR-LF1 startup", top_k=3)
     assert len(results) >= 1
+
+
+# ---------------------------------------------------------------------------
+# PlantDataLoader
+# ---------------------------------------------------------------------------
+
+from msr_kb_sources import PlantDataLoader  # noqa: E402
+
+
+@pytest.fixture()
+def plant_loader(tmp_path):
+    return PlantDataLoader(kb_dir=tmp_path / "kb")
+
+
+def test_plant_loader_ingest_text(plant_loader, tmp_path):
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 2
+    n = plant_loader.ingest_text(
+        rag_mock,
+        "Core temperature 702°C at 14:32 UTC",
+        source_id="event-001",
+    )
+    assert n == 2
+    rag_mock.add_document.assert_called_once()
+    # Verify source label includes the data type and source_id
+    call_kwargs = rag_mock.add_document.call_args
+    source_arg = call_kwargs[1].get("source") or call_kwargs[0][1]
+    assert "event-001" in source_arg
+
+
+def test_plant_loader_ingest_text_deduplication(plant_loader):
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+
+    plant_loader.ingest_text(rag_mock, "reading 1", source_id="snap-001")
+    plant_loader.ingest_text(rag_mock, "reading 2", source_id="snap-001")  # duplicate
+
+    assert rag_mock.add_document.call_count == 1
+
+
+def test_plant_loader_empty_content_returns_zero(plant_loader):
+    rag_mock = MagicMock()
+    n = plant_loader.ingest_text(rag_mock, "", source_id="empty-001")
+    assert n == 0
+    rag_mock.add_document.assert_not_called()
+
+
+def test_plant_loader_invalid_data_type_defaults_to_operational(plant_loader):
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+    n = plant_loader.ingest_text(
+        rag_mock, "some data", source_id="x-001", data_type="unknown_type"
+    )
+    assert n == 1
+    source_arg = rag_mock.add_document.call_args[1].get("source") or \
+                 rag_mock.add_document.call_args[0][1]
+    assert "operational_data" in source_arg
+
+
+def test_plant_loader_state_persisted(plant_loader, tmp_path):
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+    plant_loader.ingest_text(rag_mock, "reading A", source_id="A-001")
+    plant_loader.ingest_text(rag_mock, "reading B", source_id="B-002")
+
+    state = _load_state(plant_loader._state_path)
+    assert "A-001" in state["ingested_ids"]
+    assert "B-002" in state["ingested_ids"]
+    assert state["total_ingested"] == 2
+
+
+def test_plant_loader_ingest_sensor_snapshot_list(plant_loader):
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+    snapshot = [
+        {"timestamp": "2024-01-15T14:00:00Z", "sensor": "core_temperature_c",
+         "value": 702.1, "unit": "°C"},
+        {"timestamp": "2024-01-15T14:00:00Z", "sensor": "reactor_power_mw",
+         "value": 99.8, "unit": "MW"},
+    ]
+    n = plant_loader.ingest_sensor_snapshot(rag_mock, snapshot, source_id="snap-list-001")
+    assert n == 1
+    # Verify formatted text contains sensor name
+    call_text = rag_mock.add_document.call_args[0][0]
+    assert "core_temperature_c" in call_text
+    assert "702.1" in call_text
+
+
+def test_plant_loader_ingest_sensor_snapshot_dict(plant_loader):
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+    snapshot = {
+        "timestamp": "2024-01-15T14:00:00Z",
+        "core_temperature_c": 702.1,
+        "reactor_power_mw": 99.8,
+    }
+    n = plant_loader.ingest_sensor_snapshot(rag_mock, snapshot, source_id="snap-dict-001")
+    assert n == 1
+    call_text = rag_mock.add_document.call_args[0][0]
+    assert "702.1" in call_text
+
+
+def test_plant_loader_ingest_sensor_snapshot_json_string(plant_loader):
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+    import json as _json
+    snapshot_str = _json.dumps({"core_temperature_c": 700.0, "reactor_power_mw": 100.0})
+    n = plant_loader.ingest_sensor_snapshot(rag_mock, snapshot_str, source_id="snap-str-001")
+    assert n == 1
+
+
+def test_plant_loader_status_empty(plant_loader):
+    st = plant_loader.status()
+    assert st["total_ingested"] == 0
+    assert st["last_run"] == "never"
+    assert "plant" in st["source"].lower()
+
+
+def test_plant_loader_status_after_ingest(plant_loader):
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+    plant_loader.ingest_text(rag_mock, "data", source_id="s001")
+    plant_loader.ingest_text(rag_mock, "data2", source_id="s002")
+    st = plant_loader.status()
+    assert st["total_ingested"] == 2
+    assert st["last_run"] != "never"
+
+
+def test_plant_loader_format_snapshot_unknown_type():
+    """Non-dict/non-list snapshots are converted to string."""
+    text = PlantDataLoader._format_snapshot("raw string data")
+    assert text == "raw string data"
+
+
+def test_kb_source_manager_ingest_plant_data(source_manager):
+    rag_mock, mgr = source_manager
+    rag_mock.add_document.return_value = 1
+    n = mgr.ingest_plant_data(
+        "Salt level 87% at 15:00 UTC",
+        source_id="level-check-001",
+        data_type="event_log",
+    )
+    assert n == 1
+    rag_mock.add_document.assert_called()
+

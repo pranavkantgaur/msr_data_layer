@@ -1,30 +1,63 @@
 """
-MSR Data Layer - MCP Server
+MSR Data Layer – MCP Server
 
-Exposes MSR (Molten Salt Reactor) digital twin data through the
-Model Context Protocol (MCP), allowing LLM agents to query and
-interact with reactor state, sensor readings, and simulation results.
+Exposes MSR (Molten Salt Reactor) plant data through the Model Context
+Protocol (MCP), allowing LLM agents to read live sensor data, monitor
+alarms, and ingest operational data into the knowledge base.
+
+This module is a **data layer** – it reads from an external plant data
+source (SCADA, historian, or digital twin) and provides a clean MCP
+interface for agents and operators.  It does **not** contain a built-in
+reactor simulation or accept control commands.
+
+Data Source
+-----------
+Set ``MSR_PLANT_DATA_URL`` to the base URL of an external REST API that
+returns plant sensor data as a JSON object.  When unset, a development
+stub with representative FLiBe-MSR parameters is used so the service
+can be exercised without a live data connection.
+
+The external API is expected to respond to ``GET <MSR_PLANT_DATA_URL>``
+with a JSON object whose keys are sensor names (e.g.
+``"core_temperature_c": 700.5``).
+
+MCP Tools provided
+------------------
+Read tools (always present):
+- ``get_reactor_status``   – summary of key operational parameters
+- ``get_sensor_reading``   – latest value of a named sensor
+- ``get_all_sensor_readings`` – all sensor values at once
+- ``get_sensor_history``   – recent history for a sensor
+- ``get_active_alarms``    – active safety/operational alarms
+- ``get_data_source_info`` – data source connectivity and configuration
+
+Write tools (data ingestion):
+- ``ingest_plant_data``    – ingest operational data into the knowledge base
+
+Environment Variables
+---------------------
+MSR_PLANT_DATA_URL   URL of external plant data REST API (optional)
+                     When unset, the development stub is used.
 """
 
 import json
-import math
-import random
+import os
 import time
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Simulated MSR state (in a real deployment this would connect to a database
-# or a live SCADA / historian system)
+# Development stub – representative FLiBe-MSR parameters
+# (used only when MSR_PLANT_DATA_URL is not set)
 # ---------------------------------------------------------------------------
 
-_BASE_STATE: dict[str, Any] = {
+_STUB_STATE: dict[str, Any] = {
     "reactor_power_mw": 100.0,
     "core_temperature_c": 700.0,
     "salt_flow_rate_kg_s": 250.0,
     "fuel_salt_level_pct": 87.5,
     "coolant_salt_level_pct": 91.2,
-    "control_rod_position_pct": 45.0,
     "neutron_flux_n_cm2_s": 2.5e13,
     "primary_loop_pressure_bar": 1.1,
     "heat_exchanger_outlet_c": 565.0,
@@ -36,20 +69,43 @@ _BASE_STATE: dict[str, Any] = {
     "last_updated": datetime.now(timezone.utc).isoformat(),
 }
 
-_ALARMS: list[dict[str, str]] = []
+_ALARMS: list[dict[str, Any]] = []
 
 _SENSOR_HISTORY: dict[str, list[float]] = {
-    key: [] for key in _BASE_STATE if isinstance(_BASE_STATE[key], (int, float))
+    key: [] for key in _STUB_STATE if isinstance(_STUB_STATE[key], (int, float))
 }
 
 
 def _get_current_state() -> dict[str, Any]:
-    """Return a snapshot of the current reactor state with small noise."""
-    noise_factor = 0.002  # 0.2 % random walk
-    state = dict(_BASE_STATE)
-    for key, value in state.items():
-        if isinstance(value, float):
-            state[key] = round(value * (1 + random.uniform(-noise_factor, noise_factor)), 4)
+    """
+    Return the current plant sensor state.
+
+    Fetches from ``MSR_PLANT_DATA_URL`` when configured.
+    Falls back to the development stub when the URL is unset or unreachable.
+    """
+    external_url = os.environ.get("MSR_PLANT_DATA_URL", "").strip()
+    if external_url:
+        try:
+            req = urllib.request.Request(
+                external_url,
+                headers={"Accept": "application/json", "User-Agent": "msr-data-layer/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, dict):
+                data.setdefault("last_updated", datetime.now(timezone.utc).isoformat())
+                return data
+        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
+                OSError, TimeoutError, ValueError) as exc:
+            import sys
+            print(
+                f"[DataLayer] Could not fetch from MSR_PLANT_DATA_URL ({exc!r}); "
+                "using development stub.",
+                file=sys.stderr,
+            )
+
+    # Development stub – return copy with timestamp
+    state = dict(_STUB_STATE)
     state["last_updated"] = datetime.now(timezone.utc).isoformat()
     return state
 
@@ -67,14 +123,15 @@ def _record_history(state: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 def get_reactor_status() -> dict[str, Any]:
-    """Return the current operational status of the MSR."""
+    """Return the current operational status of the MSR plant."""
     state = _get_current_state()
     _record_history(state)
     return {
-        "status": state["status"],
-        "reactor_power_mw": state["reactor_power_mw"],
-        "core_temperature_c": state["core_temperature_c"],
+        "status": state.get("status", "UNKNOWN"),
+        "reactor_power_mw": state.get("reactor_power_mw"),
+        "core_temperature_c": state.get("core_temperature_c"),
         "last_updated": state["last_updated"],
+        "data_source": os.environ.get("MSR_PLANT_DATA_URL", "development-stub"),
     }
 
 
@@ -85,7 +142,7 @@ def get_sensor_reading(sensor_name: str) -> dict[str, Any]:
     Parameters
     ----------
     sensor_name : str
-        One of the keys in the reactor state dictionary, e.g.
+        One of the keys in the plant sensor state dictionary, e.g.
         ``"core_temperature_c"`` or ``"reactor_power_mw"``.
     """
     state = _get_current_state()
@@ -100,11 +157,12 @@ def get_sensor_reading(sensor_name: str) -> dict[str, Any]:
         "value": state[sensor_name],
         "unit": _sensor_unit(sensor_name),
         "timestamp": state["last_updated"],
+        "data_source": os.environ.get("MSR_PLANT_DATA_URL", "development-stub"),
     }
 
 
 def get_all_sensor_readings() -> dict[str, Any]:
-    """Return readings for every sensor in the reactor model."""
+    """Return readings for every sensor in the current plant state."""
     state = _get_current_state()
     _record_history(state)
     readings = {
@@ -112,7 +170,11 @@ def get_all_sensor_readings() -> dict[str, Any]:
         for k, v in state.items()
         if isinstance(v, (int, float))
     }
-    return {"readings": readings, "timestamp": state["last_updated"]}
+    return {
+        "readings": readings,
+        "timestamp": state["last_updated"],
+        "data_source": os.environ.get("MSR_PLANT_DATA_URL", "development-stub"),
+    }
 
 
 def get_sensor_history(sensor_name: str, last_n: int = 10) -> dict[str, Any]:
@@ -138,89 +200,92 @@ def get_sensor_history(sensor_name: str, last_n: int = 10) -> dict[str, Any]:
     }
 
 
-def set_control_rod_position(position_pct: float) -> dict[str, Any]:
-    """
-    Adjust the control rod insertion depth.
-
-    Parameters
-    ----------
-    position_pct : float
-        Desired position as a percentage (0 = fully inserted / shutdown,
-        100 = fully withdrawn / maximum reactivity).
-    """
-    if not 0.0 <= position_pct <= 100.0:
-        return {"error": "position_pct must be between 0 and 100."}
-    _BASE_STATE["control_rod_position_pct"] = round(position_pct, 2)
-    # Proportionally adjust power and neutron flux
-    scale = position_pct / 100.0
-    _BASE_STATE["reactor_power_mw"] = round(100.0 * scale, 2)
-    _BASE_STATE["neutron_flux_n_cm2_s"] = round(2.5e13 * scale, 2)
-    return {
-        "success": True,
-        "control_rod_position_pct": _BASE_STATE["control_rod_position_pct"],
-        "reactor_power_mw": _BASE_STATE["reactor_power_mw"],
-        "message": "Control rod position updated in simulation.",
-    }
-
-
 def get_active_alarms() -> dict[str, Any]:
     """Return the list of currently active alarms."""
     _check_alarms()
     return {"alarm_count": len(_ALARMS), "alarms": list(_ALARMS)}
 
 
-def acknowledge_alarm(alarm_id: str) -> dict[str, Any]:
+def get_data_source_info() -> dict[str, Any]:
     """
-    Acknowledge an active alarm by its ID.
+    Return information about the configured plant data source.
 
-    Parameters
-    ----------
-    alarm_id : str
-        The ``alarm_id`` field from a record returned by :func:`get_active_alarms`.
+    Shows whether the service is connected to a live external data source
+    or using the development stub.
     """
-    global _ALARMS  # noqa: PLW0603
-    before = len(_ALARMS)
-    _ALARMS = [a for a in _ALARMS if a["alarm_id"] != alarm_id]
-    if len(_ALARMS) < before:
-        return {"success": True, "message": f"Alarm '{alarm_id}' acknowledged."}
-    return {"success": False, "message": f"Alarm '{alarm_id}' not found."}
+    external_url = os.environ.get("MSR_PLANT_DATA_URL", "").strip()
+    info: dict[str, Any] = {
+        "mode": "external" if external_url else "development-stub",
+        "plant_data_url": external_url or None,
+    }
+    if external_url:
+        # Test connectivity
+        try:
+            req = urllib.request.Request(
+                external_url,
+                headers={"Accept": "application/json", "User-Agent": "msr-data-layer/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read()
+            info["connected"] = True
+            info["message"] = "External data source reachable."
+        except (urllib.error.URLError, urllib.error.HTTPError,
+                OSError, TimeoutError) as exc:
+            info["connected"] = False
+            info["message"] = f"External data source unreachable: {exc}"
+    else:
+        info["connected"] = True
+        info["message"] = (
+            "Using development stub data. "
+            "Set MSR_PLANT_DATA_URL to connect to a live plant data source."
+        )
+    return info
 
 
-def run_thermal_simulation(
-    power_mw: float,
-    inlet_temp_c: float,
-    flow_rate_kg_s: float,
+def ingest_plant_data(
+    content: str,
+    data_type: str = "operational_data",
+    source_id: str = "",
 ) -> dict[str, Any]:
     """
-    Run a simplified steady-state thermal-hydraulic simulation.
+    Ingest plant operational data into the knowledge base.
+
+    Use this tool to push sensor snapshots, event logs, maintenance reports,
+    or any plant operational records into the RAG knowledge base so they
+    become searchable by future queries.
 
     Parameters
     ----------
-    power_mw : float
-        Reactor thermal power in MW.
-    inlet_temp_c : float
-        Primary salt inlet temperature in °C.
-    flow_rate_kg_s : float
-        Primary salt mass flow rate in kg/s.
+    content : str
+        The plant data to ingest.  Can be plain text (e.g. a maintenance
+        report) or a JSON-encoded sensor snapshot / event log.
+    data_type : str
+        Category of the data: ``"sensor_snapshot"``, ``"event_log"``,
+        ``"maintenance_report"``, or ``"operational_data"`` (default).
+    source_id : str
+        Optional unique identifier for the data record.  When omitted, a
+        timestamp-based ID is generated.  Duplicate source IDs are skipped.
     """
-    # Specific heat capacity of FLiBe salt ≈ 2415 J/(kg·K)
-    cp_flibe = 2415.0
-    delta_t = (power_mw * 1e6) / (flow_rate_kg_s * cp_flibe)
-    outlet_temp_c = inlet_temp_c + delta_t
-    # Thermal efficiency estimate (Carnot-like, T_hot in K vs T_cold = 300 K)
-    t_hot_k = (outlet_temp_c + 273.15)
-    t_cold_k = 300.0
-    efficiency = 1 - t_cold_k / t_hot_k
-    electrical_output_mwe = power_mw * efficiency
-    return {
-        "power_mw": power_mw,
-        "inlet_temp_c": round(inlet_temp_c, 2),
-        "outlet_temp_c": round(outlet_temp_c, 2),
-        "delta_t_c": round(delta_t, 2),
-        "estimated_efficiency": round(efficiency, 4),
-        "estimated_electrical_output_mwe": round(electrical_output_mwe, 2),
-        "note": "Simplified steady-state model using FLiBe heat capacity.",
-    }
+    if not content or not content.strip():
+        return {"success": False, "error": "content must not be empty."}
+    if not source_id:
+        source_id = f"{data_type}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+
+    try:
+        from msr_kb_sources import PlantDataLoader  # noqa: PLC0415
+        from msr_digital_twin_with_rag import MSRDigitalTwinRAG  # noqa: PLC0415
+
+        rag = MSRDigitalTwinRAG()
+        loader = PlantDataLoader()
+        chunks_added = loader.ingest_text(rag, content, source_id, data_type=data_type)
+        return {
+            "success": True,
+            "source_id": source_id,
+            "data_type": data_type,
+            "chunks_added": chunks_added,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"Ingestion failed: {exc}"}
 
 
 # ---------------------------------------------------------------------------
@@ -230,13 +295,13 @@ def run_thermal_simulation(
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_reactor_status",
-        "description": "Get the current operational status and key parameters of the MSR.",
+        "description": "Get the current operational status and key parameters of the MSR plant.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
         "handler": get_reactor_status,
     },
     {
         "name": "get_sensor_reading",
-        "description": "Read the latest value of a specific MSR sensor.",
+        "description": "Read the latest value of a specific MSR plant sensor.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -251,7 +316,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_all_sensor_readings",
-        "description": "Get the latest readings from all MSR sensors at once.",
+        "description": "Get the latest readings from all MSR plant sensors at once.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
         "handler": get_all_sensor_readings,
     },
@@ -273,57 +338,47 @@ TOOLS: list[dict[str, Any]] = [
         "handler": get_sensor_history,
     },
     {
-        "name": "set_control_rod_position",
-        "description": "Adjust the control rod position to change reactor power.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "position_pct": {
-                    "type": "number",
-                    "description": "Control rod position 0-100 %.",
-                }
-            },
-            "required": ["position_pct"],
-        },
-        "handler": set_control_rod_position,
-    },
-    {
         "name": "get_active_alarms",
-        "description": "List all currently active alarms in the MSR system.",
+        "description": "List all currently active alarms in the MSR plant system.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
         "handler": get_active_alarms,
     },
     {
-        "name": "acknowledge_alarm",
-        "description": "Acknowledge an active alarm by its ID.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "alarm_id": {
-                    "type": "string",
-                    "description": "The alarm_id to acknowledge.",
-                }
-            },
-            "required": ["alarm_id"],
-        },
-        "handler": acknowledge_alarm,
+        "name": "get_data_source_info",
+        "description": (
+            "Return information about the configured plant data source, "
+            "including connectivity status and whether a live SCADA/historian URL is configured."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "handler": get_data_source_info,
     },
     {
-        "name": "run_thermal_simulation",
+        "name": "ingest_plant_data",
         "description": (
-            "Run a simplified steady-state thermal-hydraulic simulation "
-            "for the MSR primary loop."
+            "Ingest plant operational data (sensor snapshots, event logs, "
+            "maintenance reports) into the RAG knowledge base for future queries."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "power_mw": {"type": "number", "description": "Reactor power in MW."},
-                "inlet_temp_c": {"type": "number", "description": "Salt inlet temp in °C."},
-                "flow_rate_kg_s": {"type": "number", "description": "Flow rate in kg/s."},
+                "content": {
+                    "type": "string",
+                    "description": "Plant data text or JSON-encoded record to ingest.",
+                },
+                "data_type": {
+                    "type": "string",
+                    "description": "Category: sensor_snapshot, event_log, maintenance_report, operational_data.",
+                    "default": "operational_data",
+                },
+                "source_id": {
+                    "type": "string",
+                    "description": "Optional unique ID for the record (auto-generated if omitted).",
+                    "default": "",
+                },
             },
-            "required": ["power_mw", "inlet_temp_c", "flow_rate_kg_s"],
+            "required": ["content"],
         },
-        "handler": run_thermal_simulation,
+        "handler": ingest_plant_data,
     },
 ]
 
@@ -421,7 +476,6 @@ def _sensor_unit(sensor_name: str) -> str:
         "salt_flow_rate_kg_s": "kg/s",
         "fuel_salt_level_pct": "%",
         "coolant_salt_level_pct": "%",
-        "control_rod_position_pct": "%",
         "neutron_flux_n_cm2_s": "n/cm²/s",
         "primary_loop_pressure_bar": "bar",
         "heat_exchanger_outlet_c": "°C",

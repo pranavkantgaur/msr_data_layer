@@ -1,11 +1,23 @@
 # MSR Data Layer
 
-A **Molten Salt Reactor (MSR) digital twin** exposed through the
-[Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io),
-enabling LLM agents (Claude, GitHub Copilot, custom agents) to query
-live reactor sensor data, run thermal-hydraulic simulations, monitor
-alarms, and retrieve answers from technical documents via an enhanced
-multi-step Retrieval-Augmented Generation (RAG) pipeline.
+A **data layer for Molten Salt Reactor (MSR) design, construction, and operations**,
+exposed through the [Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io).
+
+The repo serves as a **knowledge-base and live-data interface** so that LLM agents
+(Claude, GitHub Copilot, custom agents) and human operators can:
+
+* **Query reference documents** – historical ORNL MSR reports, academic papers,
+  maintenance logs, and plant operational data via an enhanced multi-step
+  Retrieval-Augmented Generation (RAG) pipeline.
+* **Read live plant data** – sensor readings and alarms from an external plant data
+  source (SCADA, historian, or digital twin API), or a development stub when no
+  external URL is configured.
+* **Ingest operational data** – push real-time sensor snapshots, event logs, and
+  maintenance reports into the knowledge base so future queries incorporate actual
+  plant experience.
+
+The repo is **not** a digital twin itself.  It is designed to work alongside an
+existing digital twin or simulation tool by acting as its knowledge and data layer.
 
 The RAG implementation is inspired by the
 [open-notebook](https://github.com/lfnovo/open-notebook) project,
@@ -18,12 +30,12 @@ parallel-search approach.
 
 | File | Description |
 |---|---|
-| `msr_mcp_server.py` | Core MCP server – tool handlers, JSON-RPC dispatcher |
+| `msr_mcp_server.py` | MCP server – read-only data tools + `ingest_plant_data`; configurable external data source |
 | `msr_mcp_server_main.py` | Entry point – stdio transport server |
-| `msr_digital_twin_client.py` | Python client for the MCP server |
+| `msr_digital_twin_client.py` | Python client for the MCP server (`MSRDataLayerClient`) |
 | `msr_digital_twin_with_rag.py` | Enhanced multi-step RAG pipeline (+ GPU engines) |
-| `msr_kb_sources.py` | KB source loaders: msr-archive (static) + OpenAlex (dynamic) |
-| `lambda_function.py` | AWS Lambda handler (HTTP API + EventBridge scheduler) |
+| `msr_kb_sources.py` | KB source loaders: msr-archive, OpenAlex, and `PlantDataLoader` |
+| `lambda_function.py` | AWS Lambda handler (HTTP API + EventBridge + `/data/ingest`) |
 | `template.yaml` | AWS SAM template (Lambda + API Gateway + S3 + GPU variant) |
 | `Dockerfile.gpu` | GPU-capable container image (CUDA + sentence-transformers + transformers) |
 | `Makefile` | Build / deploy / local-dev / GPU container targets |
@@ -35,7 +47,7 @@ parallel-search approach.
 | `MSR_MCP_DEPLOYMENT_GUIDE.md` | Deployment and production guide |
 | `test_msr_mcp_server.py` | Unit tests for MCP server |
 | `test_msr_rag.py` | Unit tests for RAG pipeline (including GPU engine tests) |
-| `test_msr_kb_sources.py` | Unit tests for KB source loaders |
+| `test_msr_kb_sources.py` | Unit tests for KB source loaders (including PlantDataLoader) |
 | `test_lambda_function.py` | Unit tests for Lambda handler |
 
 ---
@@ -62,23 +74,66 @@ python msr_digital_twin_with_rag.py "What is the current core temperature?"
 
 # With LLM – multi-step RAG: decompose → parallel search → synthesize
 export MSR_OPENAI_API_KEY=sk-...
-python msr_digital_twin_with_rag.py "Is the reactor operating within safe limits?"
+python msr_digital_twin_with_rag.py "Is the plant operating within safe limits?"
 ```
 
-### 4 – Connect Claude Desktop
+### 4 – Connect to a live plant data source
+
+```bash
+# Set the URL of your SCADA/historian/digital twin REST API
+export MSR_PLANT_DATA_URL=https://your-scada.example.com/api/plant/state
+
+# The MCP server will now read live data from that URL instead of the stub
+python msr_mcp_server_main.py
+```
+
+### 5 – Connect Claude Desktop
 
 Add to `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "msr-digital-twin": {
+    "msr-data-layer": {
       "command": "python",
       "args": ["/path/to/msr_mcp_server_main.py"]
     }
   }
 }
 ```
+
+---
+
+## MCP Tools
+
+The data layer exposes 7 tools via the Model Context Protocol:
+
+| Tool | Type | Description |
+|---|---|---|
+| `get_reactor_status` | Read | Current plant operational status (power, temperature, last-updated) |
+| `get_sensor_reading` | Read | Latest value of a named sensor |
+| `get_all_sensor_readings` | Read | All sensor values in one call |
+| `get_sensor_history` | Read | Last N readings for a sensor (in-memory session buffer) |
+| `get_active_alarms` | Read | Currently active safety/operational alarms |
+| `get_data_source_info` | Read | Data source configuration and connectivity status |
+| `ingest_plant_data` | Write | Push operational data into the RAG knowledge base |
+
+> **No simulation or control-actuation tools are exposed.**  This is a data
+> layer – it reads from and ingests into external sources, not from a
+> built-in reactor model.
+
+### External data source (`MSR_PLANT_DATA_URL`)
+
+When `MSR_PLANT_DATA_URL` is set, sensor read tools fetch from that URL:
+
+```
+GET MSR_PLANT_DATA_URL
+→ { "core_temperature_c": 700.5, "reactor_power_mw": 99.8, ... }
+```
+
+If the URL is unreachable or unset, a **development stub** with representative
+FLiBe-MSR parameters is used so the service can be exercised without a live
+data connection.
 
 ---
 
@@ -90,7 +145,7 @@ The RAG pipeline adopts the multi-step approach from
 ```
 Ingestion:
   Document ──► sentence-aware chunking
-           ──► dense embeddings (OpenAI API or random-projection fallback)
+           ──► dense embeddings (local GPU / OpenAI API / random-projection)
            ──► source insights (LLM: summary + topics + key_facts)
            ──► persistent KnowledgeBase (JSON + numpy)
 
@@ -98,15 +153,25 @@ Retrieval (per question):
   Question ──► [Step 1] QueryDecomposer (LLM) ──► up to 5 SubQueries
            ──► [Step 2] Parallel hybrid search (dense cosine + TF-IDF)
            ──► [Step 3] Sub-answer extraction (LLM per sub-query)
-           ──► [Step 4] Synthesis (LLM: sub-answers + live reactor data)
+           ──► [Step 4] Synthesis (LLM: sub-answers + live plant data)
 ```
 
 ### Embedding engines
 
 | Condition | Engine used |
 |---|---|
+| `MSR_USE_LOCAL_GPU=true` | `LocalGPUEmbeddingEngine` – sentence-transformers, CUDA/MPS/CPU |
 | `MSR_OPENAI_API_KEY` set | `OpenAIEmbeddingEngine` – real semantic embeddings |
-| No API key | `RandomProjectionEmbeddingEngine` – numpy, no external deps |
+| No API key, no GPU | `RandomProjectionEmbeddingEngine` – numpy, no external deps |
+
+### Knowledge base sources
+
+| Source | How to trigger |
+|---|---|
+| Local documents (`MSR_DOCS_DIR`) | Auto-loaded at startup |
+| msr-archive OCR files (ORNL reports) | `rag.load_msr_archive()` or `POST /kb/update` |
+| OpenAlex academic papers | `rag.update_openalex()` or `POST /kb/update` |
+| Plant operational data | `rag.add_document()` / `PlantDataLoader.ingest_text()` / `POST /data/ingest` |
 
 ### Loading documents
 
@@ -175,15 +240,55 @@ rag.update_openalex()           # ingest new OpenAlex papers
 
 ### State tracking
 
-Both loaders write state files to `MSR_KB_DIR` (default `./kb_store`):
+All loaders write state files to `MSR_KB_DIR` (default `./kb_store`):
 
 ```
 kb_store/
   archive_state.json    ← URLs of ingested msr-archive OCR files
   openalex_state.json   ← IDs of ingested OpenAlex works
+  plant_data_state.json ← IDs of ingested plant operational data records
 ```
 
 Re-running the updater only adds truly new content.
+
+### 3 – Plant operational data (`PlantDataLoader`)
+
+Push real-time plant data into the knowledge base so future RAG queries
+incorporate actual plant experience:
+
+```bash
+# CLI
+python msr_kb_sources.py --ingest-plant-data \
+    --content "Core temperature 702°C at 14:32 UTC, flow 248 kg/s" \
+    --data-type sensor_snapshot \
+    --source-id "shift-log-20240115T1432Z"
+
+python msr_kb_sources.py --ingest-plant-data \
+    --content-file /path/to/maintenance_report.txt \
+    --data-type maintenance_report
+```
+
+Or from Python:
+
+```python
+from msr_kb_sources import PlantDataLoader
+loader = PlantDataLoader()
+loader.ingest_text(rag, "Inspection complete. HX-1 clean.", source_id="maint-hx1-001")
+
+# Structured sensor snapshot (list or dict)
+loader.ingest_sensor_snapshot(rag, [
+    {"timestamp": "2024-01-15T14:00Z", "sensor": "core_temperature_c",
+     "value": 702.1, "unit": "°C"},
+], source_id="snap-20240115T1400Z")
+```
+
+Via the Lambda endpoint:
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+     -d '{"content": "Core temp 702°C", "data_type": "sensor_snapshot"}' \
+     https://<api>.execute-api.us-east-1.amazonaws.com/prod/data/ingest
+```
 
 ### Periodic updates (cron example)
 
@@ -379,6 +484,13 @@ curl -X POST \
      -H "X-Api-Key: $MSR_API_KEY" \
      -d '{"source": "all"}' \
      https://<api-id>.execute-api.us-east-1.amazonaws.com/prod/kb/update
+
+# Ingest plant operational data (sensor snapshot)
+curl -X POST \
+     -H "Content-Type: application/json" \
+     -H "X-Api-Key: $MSR_API_KEY" \
+     -d '{"content": "Core temperature 702°C, flow 248 kg/s at 14:32 UTC", "data_type": "sensor_snapshot"}' \
+     https://<api-id>.execute-api.us-east-1.amazonaws.com/prod/data/ingest
 ```
 
 ### Knowledge base persistence
@@ -407,18 +519,22 @@ are passed through via the SAM template parameters.
 
 ---
 
-## Available MCP Tools
+## MCP Tools (read-only + ingestion)
 
-| Tool | Description |
-|---|---|
-| `get_reactor_status` | Current status, power, and core temperature |
-| `get_sensor_reading` | Single named sensor value |
-| `get_all_sensor_readings` | All sensors at once |
-| `get_sensor_history` | Historical readings (up to last 100 samples) |
-| `set_control_rod_position` | Adjust control rod depth (0–100 %) |
-| `get_active_alarms` | List active alarms |
-| `acknowledge_alarm` | Acknowledge an alarm by ID |
-| `run_thermal_simulation` | Steady-state thermal-hydraulic simulation |
+| Tool | Type | Description |
+|---|---|---|
+| `get_reactor_status` | Read | Current status, power, core temperature, data source |
+| `get_sensor_reading` | Read | Single named sensor value |
+| `get_all_sensor_readings` | Read | All sensors at once |
+| `get_sensor_history` | Read | Historical readings (up to last 100 samples) |
+| `get_active_alarms` | Read | List active alarms |
+| `get_data_source_info` | Read | Data source mode, URL, connectivity status |
+| `ingest_plant_data` | Write | Push operational data into the RAG knowledge base |
+
+> Simulation tools (`run_thermal_simulation`) and control-actuation tools
+> (`set_control_rod_position`, `acknowledge_alarm`) are **not** included.
+> This is a data layer; simulation and control live in the digital twin or
+> process-control system.
 
 ---
 
@@ -431,12 +547,14 @@ MCP Host (Claude / agent)
 msr_mcp_server_main.py
         │
         ▼
-msr_mcp_server.py  ── tool handlers ── simulated reactor state
-                                  └── alarm checker
+msr_mcp_server.py  ── read tools ── external plant data API (MSR_PLANT_DATA_URL)
+                              │                └── development stub (fallback)
+                              └── ingest_plant_data ──► MSRDigitalTwinRAG
 
 msr_digital_twin_with_rag.py  (inspired by open-notebook)
-  ├── RandomProjectionEmbeddingEngine (numpy, no external deps)
-  ├── OpenAIEmbeddingEngine (when MSR_OPENAI_API_KEY is set)
+  ├── LocalGPUEmbeddingEngine (sentence-transformers, CUDA/MPS/CPU)
+  ├── OpenAIEmbeddingEngine   (OpenAI Embeddings API)
+  ├── RandomProjectionEmbeddingEngine (numpy fallback, no external deps)
   ├── KnowledgeBase (hybrid dense+TF-IDF, persistent)
   ├── SourceInsight (LLM-generated summary/topics/key_facts)
   ├── _decompose_query() (multi-query strategy via LLM)
@@ -452,7 +570,7 @@ msr_digital_twin_with_rag.py  (inspired by open-notebook)
 pytest -v
 ```
 
-53 unit tests covering the MCP server (19) and enhanced RAG pipeline (53, including 19 GPU engine tests), plus 34 tests for the KB source loaders and 47 tests for the Lambda handler (153 total).
+53 unit tests covering the MCP server (19) and enhanced RAG pipeline (53, including 19 GPU engine tests), plus 55 tests for the KB source loaders (including 15 PlantDataLoader tests) and 55 tests for the Lambda handler (174 total).
 
 ---
 
@@ -475,6 +593,7 @@ pytest -v
 | `MSR_KB_S3_BUCKET` | _(unset)_ | S3 bucket for Lambda KB persistence |
 | `MSR_KB_S3_PREFIX` | `kb-prod/` | S3 key prefix inside the bucket |
 | `MSR_API_KEY` | _(unset)_ | Shared API key for Lambda HTTP auth |
+| `MSR_PLANT_DATA_URL` | _(unset)_ | External plant data REST API URL (SCADA/historian/DT) |
 | `MSR_USE_LOCAL_GPU` | `false` | `true` to use local GPU models |
 | `MSR_LOCAL_EMBED_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Local embedding model |
 | `MSR_LOCAL_LLM_MODEL` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | Local generation model |
