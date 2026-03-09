@@ -981,6 +981,196 @@ hx1_entries = [r for r in results if "HX1" in r.get("source", "")]
 
 ---
 
+## Design Critique: A Rickover-Memo Perspective
+
+Admiral Hyman G. Rickover's famous memo on paper versus real reactors offers a
+useful lens for any engineering system that exists primarily as a design
+document or software prototype.  Rickover's core observation was that a *paper*
+reactor is always simple, cheap, elegant, and satisfies every requirement,
+whereas a *real* reactor is complex, expensive, messy, and barely satisfies the
+requirements that actually matter.  The same distinction applies here.
+
+> *"The educational and intellectual value of a paper reactor is zero.  It is
+> the actual reactor that teaches you things."*
+> — paraphrased from Rickover's January 1953 development-philosophy memo
+
+Applied honestly to this repository, that philosophy surfaces six serious gaps
+between what the README describes and what would be required in an actual
+nuclear plant environment.
+
+---
+
+### Critique 1 — The Development Stub IS the Product
+
+**The paper version:** "The data layer reads live sensor data from your
+SCADA/historian via `MSR_PLANT_DATA_URL`."
+
+**The real version:** When `MSR_PLANT_DATA_URL` is unset — which is the default
+and the only mode exercised by every test and demo in this repository — the
+system returns a hard-coded Python dictionary (`_STUB_STATE` in
+`msr_mcp_server.py`) with a core temperature of 700 °C, a reactor power of
+100 MW, and a flow rate of 250 kg/s.  These numbers are never validated against
+any physical model.  The stub is not a temporary scaffold; it is the only
+reactor this system has ever actually "read from."
+
+**What would be required:** A real integration requires a formally specified,
+version-controlled interface contract with the plant data historian, including
+schema validation, connection-health monitoring, timeout and retry policies,
+and an explicit failure mode that surfaces — not silently substitutes — stale
+or missing data.  The failure mode of "return the stub instead of raising an
+error" (`except Exception` swallowed in `_get_current_state()`) is the
+opposite of what nuclear data systems require.
+
+---
+
+### Critique 2 — LLM Hallucination as a Feature
+
+**The paper version:** "Multi-step RAG synthesizes a comprehensive final answer
+from sub-answers and live plant data."
+
+**The real version:** The synthesis step calls `gpt-4o-mini` (or any other
+OpenAI-compatible model) with a prompt that includes live sensor readings and
+asks it to answer questions such as *"Is the plant operating within safe limits?"*
+(the literal example in the `__main__` block of `msr_digital_twin_with_rag.py`).
+A large language model is a stochastic, non-deterministic system with no
+physical model of MSR thermodynamics, no formal verification, no nuclear
+qualification, and a well-documented propensity to generate confident but
+incorrect statements.  Presenting its output to an operator as an answer to a
+safety question is not a data layer — it is a liability.
+
+**What would be required:** LLM output must be clearly labelled as
+*unverified suggestion*, never as a safety determination.  Safety-boundary
+checks must be performed by deterministic, qualified code against validated
+sensor readings — not by a language model reasoning over retrieved text chunks.
+The system should refuse, not attempt to answer, safety-critical queries with
+an unqualified LLM.
+
+---
+
+### Critique 3 — Random Projections Labelled as Semantic Search
+
+**The paper version:** "Hybrid vector + TF-IDF retrieval over the knowledge base."
+
+**The real version:** When no `MSR_OPENAI_API_KEY` is set and no GPU is
+available — again, the default state — the embedding engine is
+`RandomProjectionEmbeddingEngine`, which multiplies the TF-IDF bag-of-words
+vector by a fixed random matrix (Johnson–Lindenstrauss projection,
+`msr_digital_twin_with_rag.py:216`).  The resulting vectors encode no learned
+semantic relationships.  A query for *"fission product release during loss of
+cooling"* and a query for *"FLiBe viscosity at 700 °C"* are likely to retrieve
+the same documents.  The system reports no signal to the caller that semantic
+search is degraded or absent; it returns results silently as if they were
+meaningful.
+
+**What would be required:** The system must make its retrieval quality
+transparent.  When operating without qualified embeddings the response should
+include an explicit quality warning, or the system should require a configured
+embedding engine before serving queries that influence operational decisions.
+
+---
+
+### Critique 4 — Alarm State Exists Only in Process Memory
+
+**The paper version:** "Get the list of currently active alarms."
+
+**The real version:** `_ALARMS` is a Python module-level list
+(`msr_mcp_server.py`).  Every time the MCP server process restarts — for any
+reason, including a Lambda cold start, an OOM kill, or a deployment update —
+the alarm list is wiped.  An alarm that was active before the restart does not
+reappear unless the sensor threshold is re-crossed after the process starts.
+There is no alarm persistence, no acknowledgement record, no alarm log, and no
+operator notification pathway.
+
+**What would be required:** In a qualified nuclear I&C system, alarm state is
+held in a persistent, redundant historian with a complete audit trail of
+assertion, acknowledgement, and clearance timestamps.  Process-memory alarm
+state is disqualifying for any system that describes itself as serving
+"safety/operational alarms."
+
+---
+
+### Critique 5 — The Knowledge Base is Scraped, Uncontrolled Content
+
+**The paper version:** "Query reference documents — historical ORNL MSR reports,
+academic papers, maintenance logs, and plant operational data."
+
+**The real version:** Documents enter the knowledge base by fetching OCR text
+from a public GitHub repository and downloading abstracts from the OpenAlex
+academic paper API.  There is no document control, no version-locked corpus,
+no verification that the retrieved text matches the authoritative source
+document, and no mechanism to retract a document once ingested.  An
+OCR error in a 1960s ORNL report, a paper retracted from OpenAlex, or a
+corrupted JSON chunk file will silently degrade retrieval quality with no
+indication to the caller.
+
+**What would be required:** A nuclear plant knowledge base must operate under
+formal document configuration management: controlled issue numbers, formal
+approval signatures, explicit supersession records, and a mechanism to
+invalidate or correct ingested content.  The answer to "what documents are in
+the knowledge base?" must be reproducible and auditable, not "whatever the
+GitHub and OpenAlex APIs returned the last time the cron job ran."
+
+---
+
+### Critique 6 — Third-Party Cloud Dependency During Operations
+
+**The paper version:** "The data layer can be deployed as a serverless HTTPS
+service."
+
+**The real version:** In its primary intended configuration, the RAG synthesis
+step sends plant sensor readings, alarm states, and potentially maintenance
+records to `api.openai.com` — a commercial service operated by a private
+company, subject to their terms of service, their data retention policies,
+their network availability, and their model update schedule (which can silently
+change model behaviour between calls).  No nuclear plant data governance
+framework permits operational data to be sent to an unqualified, uncontrolled
+external service during routine operations.
+
+**What would be required:** Either (a) all LLM inference must be fully
+air-gapped using the local GPU mode (`MSR_USE_LOCAL_GPU=true`) with a
+qualified, version-pinned, formally evaluated model, or (b) the synthesis
+step must be limited to retrieval-only (no LLM) during any mode where
+plant-operational data is present in context.  The current default of "send
+everything to OpenAI unless someone deliberately sets the local GPU flag" is
+the wrong fail-safe direction.
+
+---
+
+### The Rickover Summary
+
+A paper data layer is elegant, flexible, and satisfies all requirements.
+
+A real data layer for a nuclear plant must answer four questions that this
+repository does not currently address:
+
+1. **What happens when it fails?**  Every external dependency — the plant URL,
+   the OpenAI API, the GitHub archive, the S3 bucket — must have a documented,
+   tested, and safe failure mode.  Silent substitution of stub data is not a
+   safe failure mode.
+
+2. **Who is responsible for the answers it gives?**  An LLM synthesising safety
+   assessments from retrieved text has no responsible engineer behind it.  Every
+   answer that influences an operational decision must have a qualified, named
+   human or a formally certified deterministic algorithm behind it.
+
+3. **Has it been tested under the conditions it will actually face?**  Every
+   test in this repository runs against the stub, with a mock LLM, and with
+   random-projection embeddings.  None of those conditions resemble a deployed
+   nuclear plant environment.
+
+4. **What does it not know, and does it say so?**  A system that returns
+   confident-sounding LLM-synthesised answers without uncertainty quantification
+   or retrieval-quality indicators is more dangerous than one that returns
+   nothing at all.
+
+This repository is a useful research prototype and a starting point for
+thinking about MSR data architecture.  It is not — and should not be claimed
+to be — production-ready for any role that touches nuclear plant operations.
+Rickover would have rejected it at the first design review and sent it back
+with the instruction to return when it had actually been built and run.
+
+---
+
 ## Documentation
 
 * [00_MCP_START_HERE.md](00_MCP_START_HERE.md) – five-minute quick start
