@@ -22,12 +22,14 @@ parallel-search approach.
 | `msr_mcp_server_main.py` | Entry point – stdio transport server |
 | `msr_digital_twin_client.py` | Python client for the MCP server |
 | `msr_digital_twin_with_rag.py` | Enhanced multi-step RAG pipeline |
+| `msr_kb_sources.py` | KB source loaders: msr-archive (static) + OpenAlex (dynamic) |
 | `requirements_mcp.txt` | Python dependencies |
 | `00_MCP_START_HERE.md` | Quick-start guide |
 | `MSR_DIGITAL_TWIN_MCP_GUIDE.md` | Full architecture and tool reference |
 | `MSR_MCP_DEPLOYMENT_GUIDE.md` | Deployment and production guide |
 | `test_msr_mcp_server.py` | Unit tests for MCP server |
 | `test_msr_rag.py` | Unit tests for enhanced RAG pipeline |
+| `test_msr_kb_sources.py` | Unit tests for KB source loaders |
 
 ---
 
@@ -114,6 +116,77 @@ embedded once.
 
 ---
 
+## Knowledge Base Sources (`msr_kb_sources.py`)
+
+The knowledge base is populated from two external sources via
+`msr_kb_sources.py`:
+
+### 1 – Static source: pranavkantgaur/msr-archive
+
+Historical ORNL Molten Salt Reactor reports, OCR-transcribed to text,
+from the [msr-archive](https://github.com/pranavkantgaur/msr-archive)
+repository (`ocr/` directory).
+
+```bash
+# Ingest all new OCR files (first run fetches everything; subsequent runs add only new files)
+python msr_kb_sources.py --update-archive
+
+# Limit to 20 files per run
+python msr_kb_sources.py --update-archive --max-docs 20
+```
+
+Or from Python:
+
+```python
+from msr_digital_twin_with_rag import MSRDigitalTwinRAG
+rag = MSRDigitalTwinRAG()
+rag.load_msr_archive()          # ingest new ORNL documents
+```
+
+### 2 – Dynamic source: OpenAlex academic papers
+
+Papers from the [OpenAlex](https://openalex.org) API matching:
+- `"molten salt reactors experimental data"` (broad MSR coverage)
+- `"TMSR-LF1"` (targeted: TMSR-LF1 reactor, SINAP, China)
+
+```bash
+# Ingest new papers (default: up to 100 per run)
+python msr_kb_sources.py --update-openalex
+
+# Use both sources at once
+python msr_kb_sources.py --update-all
+
+# Show current ingestion state without fetching
+python msr_kb_sources.py --status
+```
+
+Or from Python:
+
+```python
+rag.update_openalex()           # ingest new OpenAlex papers
+```
+
+### State tracking
+
+Both loaders write state files to `MSR_KB_DIR` (default `./kb_store`):
+
+```
+kb_store/
+  archive_state.json    ← URLs of ingested msr-archive OCR files
+  openalex_state.json   ← IDs of ingested OpenAlex works
+```
+
+Re-running the updater only adds truly new content.
+
+### Periodic updates (cron example)
+
+```cron
+# Update knowledge base daily at 02:00 UTC
+0 2 * * *  cd /opt/msr && python msr_kb_sources.py --update-all >> logs/kb_update.log 2>&1
+```
+
+---
+
 ## Available MCP Tools
 
 | Tool | Description |
@@ -159,7 +232,7 @@ msr_digital_twin_with_rag.py  (inspired by open-notebook)
 pytest -v
 ```
 
-53 unit tests covering the MCP server (19) and enhanced RAG pipeline (34).
+53 unit tests covering the MCP server (19) and enhanced RAG pipeline (34), plus 34 tests for the KB source loaders (68 + 34 = 102 total).
 
 ---
 
@@ -173,6 +246,12 @@ pytest -v
 | `MSR_EMBED_MODEL` | `text-embedding-3-small` | Embedding model |
 | `MSR_DOCS_DIR` | `./docs` | Reference documents directory |
 | `MSR_KB_DIR` | `./kb_store` | Persistent knowledge-base directory |
+| `MSR_ARCHIVE_REPO` | `pranavkantgaur/msr-archive` | GitHub owner/repo for static source |
+| `MSR_ARCHIVE_BRANCH` | `master` | Branch of the archive repo |
+| `MSR_ARCHIVE_MAX_DOCS` | `0` (unlimited) | Max OCR files per archive run |
+| `MSR_OPENALEX_MAX_RESULTS` | `100` | Max OpenAlex papers per run |
+| `MSR_OPENALEX_EMAIL` | _(unset)_ | Email for OpenAlex polite pool |
+| `MSR_GITHUB_TOKEN` | _(unset)_ | GitHub PAT for higher API rate limits |
 
 ---
 

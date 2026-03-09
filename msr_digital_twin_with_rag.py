@@ -40,6 +40,22 @@ MSR_OPENAI_MODEL      Chat model (default: gpt-4o-mini)
 MSR_EMBED_MODEL       Embedding model (default: text-embedding-3-small)
 MSR_DOCS_DIR          Reference documents directory (default: ./docs)
 MSR_KB_DIR            Persistent knowledge-base directory (default: ./kb_store)
+
+Document Sources
+----------------
+In addition to local files in ``MSR_DOCS_DIR``, the knowledge base can be
+populated from two external sources (see ``msr_kb_sources.py``):
+
+* **Static source** – ``pranavkantgaur/msr-archive`` GitHub repository:
+  OCR transcriptions of historical ORNL Molten Salt Reactor reports.
+  Fetched via :meth:`MSRDigitalTwinRAG.load_msr_archive`.
+
+* **Dynamic source** – OpenAlex academic papers API:
+  Papers matching "molten salt reactors experimental data" plus a targeted
+  TMSR-LF1 query (SINAP, China).
+  Fetched via :meth:`MSRDigitalTwinRAG.update_openalex`.
+
+Both sources maintain state files so only new documents are re-ingested.
 """
 
 from __future__ import annotations
@@ -748,6 +764,49 @@ class MSRDigitalTwinRAG:
                 text, source, self._api_key, self._base_url, self._model
             )
         return self._kb.add_document(text, source=source, insight=insight)
+
+    def load_msr_archive(self, max_docs: int = 0) -> int:
+        """
+        Ingest new OCR documents from ``pranavkantgaur/msr-archive``.
+
+        Delegates to :class:`~msr_kb_sources.MSRArchiveLoader`.
+        Documents already in the knowledge base are skipped.
+
+        Parameters
+        ----------
+        max_docs:
+            Maximum number of new files to ingest (``0`` = no limit).
+
+        Returns
+        -------
+        int
+            Number of documents newly added.
+        """
+        from msr_kb_sources import MSRArchiveLoader  # noqa: PLC0415
+        loader = MSRArchiveLoader()
+        return loader.ingest(self, max_docs=max_docs)
+
+    def update_openalex(self, max_docs: int | None = None) -> int:
+        """
+        Ingest new papers from the OpenAlex API (MSR experimental data and
+        TMSR-LF1 SINAP targeted queries).
+
+        Delegates to :class:`~msr_kb_sources.OpenAlexLoader`.
+
+        Parameters
+        ----------
+        max_docs:
+            Maximum number of new papers to ingest (``None`` uses the
+            ``MSR_OPENALEX_MAX_RESULTS`` env var, default 100).
+
+        Returns
+        -------
+        int
+            Number of documents newly added.
+        """
+        from msr_kb_sources import OpenAlexLoader  # noqa: PLC0415
+        loader = OpenAlexLoader()
+        return loader.ingest(self, max_docs=max_docs)
 
     def answer(self, question: str, top_k: int = 5) -> str:
         """
