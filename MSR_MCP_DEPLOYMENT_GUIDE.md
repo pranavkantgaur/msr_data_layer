@@ -1,0 +1,1 @@
+# Content of MSR_MCP_DEPLOYMENT_GUIDE.md

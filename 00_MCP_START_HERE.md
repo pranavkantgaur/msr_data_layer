@@ -1,0 +1,1 @@
+# Content of 00_MCP_START_HERE.md

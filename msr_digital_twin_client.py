@@ -1,0 +1,1 @@
+# Content of msr_digital_twin_client.py
