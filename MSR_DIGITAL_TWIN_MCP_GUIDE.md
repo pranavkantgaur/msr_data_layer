@@ -10,6 +10,7 @@ This allows large language model (LLM) agents to:
 * Run thermal-hydraulic simulations
 * Monitor and acknowledge alarms
 * Control reactor parameters in a sandboxed environment
+* Query technical documents and operating manuals with RAG
 
 ---
 
@@ -30,12 +31,20 @@ This allows large language model (LLM) agents to:
                                                     │  └──────────────────┘    │
                                                     └───────────────────────────┘
 
-                                                    ┌───────────────────────────┐
-                                                    │ msr_digital_twin_with_rag │
-                                                    │  DocumentStore (TF-IDF)   │
-                                                    │  + Live reactor context   │
-                                                    │  + OpenAI-compatible LLM  │
-                                                    └───────────────────────────┘
+          ┌─────────────────────────────────────────────────────────────────┐
+          │  msr_digital_twin_with_rag.py  (Enhanced RAG pipeline)          │
+          │                                                                  │
+          │  Ingestion:                                                      │
+          │    Text → sentence-aware chunking → dense embeddings            │
+          │             → source insights (LLM summary/topics/key_facts)    │
+          │             → KnowledgeBase (JSON + numpy, persistent)          │
+          │                                                                  │
+          │  Retrieval (multi-step, inspired by open-notebook ask.py):      │
+          │    Question → QueryDecomposer (≤5 sub-queries via LLM)          │
+          │             → parallel hybrid search (dense + TF-IDF)           │
+          │             → sub-answer extraction per search                  │
+          │             → synthesis (sub-answers + live reactor data)       │
+          └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -81,11 +90,55 @@ subprocess and wraps each MCP tool in a typed Python method.
 
 ### `msr_digital_twin_with_rag.py`
 
-RAG pipeline:
+Enhanced multi-step RAG pipeline (inspired by
+[open-notebook](https://github.com/lfnovo/open-notebook)):
 
-1. `DocumentStore` – TF-IDF indexing and cosine-similarity retrieval
-2. `MSRDigitalTwinRAG` – orchestrates document retrieval + live reactor
-   context + LLM call
+#### Key components
+
+| Class / Function | Role |
+|---|---|
+| `EmbeddingEngine` | Abstract base for text → dense vector |
+| `RandomProjectionEmbeddingEngine` | Numpy random-projection fallback |
+| `OpenAIEmbeddingEngine` | OpenAI-compatible /embeddings API |
+| `KnowledgeBase` | Persistent hybrid (dense + TF-IDF) store |
+| `SourceInsight` | LLM-generated summary, topics, key_facts |
+| `SubQuery` | One decomposed search term + instructions |
+| `_chunk_text()` | Sentence-aware overlapping chunking |
+| `_decompose_query()` | LLM → ≤5 targeted sub-queries |
+| `_extract_insight()` | LLM → SourceInsight for a document |
+| `MSRDigitalTwinRAG` | Orchestrates the full pipeline |
+
+#### RAG Pipeline Stages
+
+```
+1. Query Decomposition
+   question ──► LLM ──► [SubQuery₁, SubQuery₂, …, SubQuery₅]
+                         (term + extraction instructions per query)
+
+2. Parallel Search (ThreadPoolExecutor)
+   SubQuery₁ ──► KnowledgeBase.search() ──► LLM ──► partial answer₁
+   SubQuery₂ ──► KnowledgeBase.search() ──► LLM ──► partial answer₂
+   …
+
+3. Synthesis
+   [partial answers + live reactor state] ──► LLM ──► final answer
+```
+
+#### Knowledge base persistence
+
+Chunks, embeddings, insights, and TF-IDF statistics are saved under
+`MSR_KB_DIR` (default `./kb_store`) as:
+
+```
+kb_store/
+  chunks.json       ← chunk text + metadata
+  embeddings.npy    ← dense embedding matrix (numpy)
+  insights.json     ← LLM-generated source insights
+  tfidf.json        ← document-frequency counts
+```
+
+The store is loaded on startup so re-embedding is skipped for already-
+indexed sources.
 
 ---
 
@@ -211,6 +264,11 @@ Estimates outlet temperature, thermal efficiency, and electrical output.
 
 Replace the `_BASE_STATE` dictionary and the `_get_current_state()`
 function with calls to your SCADA historian, OPC-UA server, or database.
+
+### Using a real vector database for RAG
+
+Replace `KnowledgeBase` with a ChromaDB or Qdrant client for large
+corpora (> 100 000 chunks).
 
 ---
 

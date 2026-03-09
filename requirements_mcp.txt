@@ -13,5 +13,10 @@
 # this dependency is optional.
 # openai>=1.0.0
 
+# Dense vector embeddings (used by the enhanced RAG module for hybrid
+# dense+sparse retrieval and the random-projection embedding engine)
+numpy>=1.24.0
+
 # Testing
 pytest>=8.0.0
+

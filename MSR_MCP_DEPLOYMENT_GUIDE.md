@@ -83,10 +83,12 @@ docker run -i msr-mcp-server   # -i keeps stdin open for the MCP host
 
 | Variable | Default | Description |
 |---|---|---|
-| `MSR_OPENAI_API_KEY` | _(unset)_ | API key for the LLM backend used by the RAG module |
+| `MSR_OPENAI_API_KEY` | _(unset)_ | API key for LLM + embeddings (RAG module) |
 | `MSR_OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
-| `MSR_OPENAI_MODEL` | `gpt-4o-mini` | Model name |
-| `MSR_DOCS_DIR` | `./docs` | Directory with reference documents for RAG |
+| `MSR_OPENAI_MODEL` | `gpt-4o-mini` | Chat model |
+| `MSR_EMBED_MODEL` | `text-embedding-3-small` | Embedding model (OpenAI engine) |
+| `MSR_DOCS_DIR` | `./docs` | Reference documents directory |
+| `MSR_KB_DIR` | `./kb_store` | Persistent knowledge-base directory |
 
 ---
 

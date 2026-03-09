@@ -72,21 +72,35 @@ Restart Claude Desktop.  The MSR tools will appear in the tool palette.
 
 ---
 
-## 5 – Try the RAG interface
+## 5 – Try the enhanced RAG interface
 
 Place reference documents (Markdown or plain text) in a `docs/` folder
 and run:
 
 ```bash
-python msr_digital_twin_with_rag.py "What is the current core temperature?"
+python msr_digital_twin_with_rag.py "What are the safe temperature limits?"
 ```
 
-Set `MSR_OPENAI_API_KEY` to enable LLM-powered answers:
+Set `MSR_OPENAI_API_KEY` to enable LLM-powered multi-step answers:
 
 ```bash
 export MSR_OPENAI_API_KEY=sk-...
+# Optional: use a different embedding model
+export MSR_EMBED_MODEL=text-embedding-3-small
+# Optional: persist knowledge base to a specific directory
+export MSR_KB_DIR=./kb_store
+
 python msr_digital_twin_with_rag.py "Is the reactor operating within safe limits?"
 ```
+
+With an API key, the RAG pipeline uses:
+1. Query decomposition → ≤5 targeted sub-queries
+2. Parallel hybrid search (dense embedding + TF-IDF)
+3. Sub-answer extraction per search result
+4. Final synthesis combining all findings + live reactor data
+
+Without an API key, the pipeline uses the random-projection embedding
+engine (numpy, no external deps) and returns an enriched context prompt.
 
 ---
 
