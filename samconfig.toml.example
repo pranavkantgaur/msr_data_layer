@@ -1,0 +1,39 @@
+# samconfig.toml.example
+#
+# Copy this file to samconfig.toml and fill in your values.
+# This file is created automatically by `make deploy-guided` (sam deploy --guided)
+# but the example below lets you skip the interactive prompts on first deploy.
+#
+# Usage:
+#   cp samconfig.toml.example samconfig.toml
+#   # edit samconfig.toml with your values
+#   make deploy          # deploys using this file (no --guided needed)
+#
+# IMPORTANT: samconfig.toml is listed in .gitignore because it may contain
+# your AWS account ID.  Never commit it to the repository.
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name          = "msr-kb-service"
+resolve_s3          = true
+s3_prefix           = "msr-kb-service"
+region              = "us-east-1"           # change to your preferred region
+confirm_changeset   = false
+capabilities        = "CAPABILITY_IAM"
+image_repositories  = []
+
+parameter_overrides = [
+    "Environment=prod",
+    "OpenAIApiKey=",         # fill in your OpenAI API key
+    "MsrApiKey=",            # fill in a secret API key (share this with demo users)
+    "OpenAlexEmail=",        # optional: your email for OpenAlex polite pool
+    "GithubToken=",          # optional: GitHub PAT for higher archive fetch rate
+    "OpenAlexMaxResults=100",
+    "KBUpdateSchedule=rate(1 day)",
+    "PlantDataUrl=",
+    "UseLocalGPU=false",
+    "GPUContainerImageUri=",
+    "LocalEmbedModel=sentence-transformers/all-MiniLM-L6-v2",
+    "LocalLLMModel=TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+]
