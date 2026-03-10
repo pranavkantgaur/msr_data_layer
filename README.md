@@ -42,8 +42,8 @@ parallel-search approach.
 | `requirements_mcp.txt` | Core Python dependencies |
 | `requirements_lambda.txt` | Lambda-specific dependencies (adds boto3) |
 | `requirements_gpu.txt` | GPU-specific dependencies (torch, sentence-transformers, transformers) |
-| `00_MCP_START_HERE.md` | Quick-start guide |
-| `MSR_DIGITAL_TWIN_MCP_GUIDE.md` | Full architecture and tool reference |
+| `00_MCP_START_HERE.md` | Quick-start guide (data layer tools, client usage) |
+| `MSR_DIGITAL_TWIN_MCP_GUIDE.md` | Full guide – architecture, tool reference, RAG pipeline, "what we don't do" |
 | `MSR_MCP_DEPLOYMENT_GUIDE.md` | Deployment and production guide |
 | `test_msr_mcp_server.py` | Unit tests for MCP server |
 | `test_msr_rag.py` | Unit tests for RAG pipeline (including GPU engine tests) |
@@ -1194,7 +1194,7 @@ new case studies.
 ## Documentation
 
 * [00_MCP_START_HERE.md](00_MCP_START_HERE.md) – five-minute quick start
-* [MSR_DIGITAL_TWIN_MCP_GUIDE.md](MSR_DIGITAL_TWIN_MCP_GUIDE.md) – full guide with RAG pipeline details
+* [MSR_DIGITAL_TWIN_MCP_GUIDE.md](MSR_DIGITAL_TWIN_MCP_GUIDE.md) – full guide: architecture, all 7 tools, RAG pipeline, what the data layer does *not* do
 * [MSR_MCP_DEPLOYMENT_GUIDE.md](MSR_MCP_DEPLOYMENT_GUIDE.md) – deployment guide
 
 ---

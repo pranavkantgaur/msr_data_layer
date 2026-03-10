@@ -26,7 +26,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`
 ```json
 {
   "mcpServers": {
-    "msr-digital-twin": {
+    "msr-data-layer": {
       "command": "python",
       "args": ["/absolute/path/to/msr_mcp_server_main.py"]
     }
@@ -41,7 +41,7 @@ Add to `.vscode/mcp.json`:
 ```json
 {
   "servers": {
-    "msr-digital-twin": {
+    "msr-data-layer": {
       "type": "stdio",
       "command": "python",
       "args": ["${workspaceFolder}/msr_mcp_server_main.py"]
@@ -53,9 +53,9 @@ Add to `.vscode/mcp.json`:
 ### Custom Python Agent
 
 ```python
-from msr_digital_twin_client import MSRDigitalTwinClient
+from msr_digital_twin_client import MSRDataLayerClient
 
-with MSRDigitalTwinClient() as client:
+with MSRDataLayerClient() as client:
     tools = client.list_tools()
     status = client.get_reactor_status()
 ```

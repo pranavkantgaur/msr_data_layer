@@ -966,7 +966,7 @@ def _extract_insight(
 
 class MSRDigitalTwinRAG:
     """
-    Multi-step RAG pipeline for the MSR digital twin knowledge base.
+    Multi-step RAG pipeline for the MSR data layer knowledge base.
 
     Enhancements over the original TF-IDF implementation, inspired by the
     open-notebook project:

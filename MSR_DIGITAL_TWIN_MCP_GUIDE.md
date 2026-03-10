@@ -1,16 +1,25 @@
-# MSR Digital Twin MCP Interface – Full Guide
+# MSR Data Layer MCP Interface – Full Guide
 
 ## Overview
 
-The MSR (Molten Salt Reactor) data layer exposes a physics-based digital
-twin through the [Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io).
-This allows large language model (LLM) agents to:
+The MSR data layer exposes MSR (Molten Salt Reactor) plant sensor data and a
+knowledge base through the [Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io).
+This allows LLM agents and human operators to:
 
-* Query real-time (simulated) sensor readings
-* Run thermal-hydraulic simulations
-* Monitor and acknowledge alarms
-* Control reactor parameters in a sandboxed environment
-* Query technical documents and operating manuals with RAG
+* Read live sensor readings and active alarms from an external plant data source
+  (SCADA system, historian API, or digital twin) — or from a built-in development
+  stub when no external URL is configured.
+* Query reference documents — historical ORNL MSR reports, academic papers,
+  and accumulated plant operational data — via an enhanced multi-step
+  Retrieval-Augmented Generation (RAG) pipeline.
+* Ingest operational data — push real-time sensor snapshots, event logs, and
+  maintenance reports into the knowledge base so future queries can incorporate
+  actual plant experience.
+
+> **The data layer is read-only for simulation and control.**  It does not contain
+> a built-in reactor simulator and does not accept control-actuation commands.
+> Simulation and control capabilities live in the digital twin or process-control
+> system that the data layer sits in front of.
 
 ---
 
@@ -25,11 +34,14 @@ This allows large language model (LLM) agents to:
                                                     │  msr_mcp_server.py       │
                                                     │  ┌──────────────────┐    │
                                                     │  │ Tool handlers    │    │
-                                                    │  │  • sensors       │    │
-                                                    │  │  • simulation    │    │
-                                                    │  │  • alarms        │    │
+                                                    │  │  • read sensors  │    │
+                                                    │  │  • read alarms   │    │
+                                                    │  │  • ingest data   │    │
                                                     │  └──────────────────┘    │
                                                     └───────────────────────────┘
+                                                               │
+                              External plant data API ◄────────┤ (MSR_PLANT_DATA_URL)
+                              (SCADA / historian / DT)         │  or development stub
 
           ┌─────────────────────────────────────────────────────────────────┐
           │  msr_digital_twin_with_rag.py  (Enhanced RAG pipeline)          │
@@ -43,7 +55,7 @@ This allows large language model (LLM) agents to:
           │    Question → QueryDecomposer (≤5 sub-queries via LLM)          │
           │             → parallel hybrid search (dense + TF-IDF)           │
           │             → sub-answer extraction per search                  │
-          │             → synthesis (sub-answers + live reactor data)       │
+          │             → synthesis (sub-answers + live plant data)         │
           └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,21 +67,21 @@ This allows large language model (LLM) agents to:
 
 Core library.  Contains:
 
-* **`_BASE_STATE`** – simulated MSR operating point
+* **`_BASE_STATE`** – development stub with representative FLiBe-MSR sensor values
+  (used when `MSR_PLANT_DATA_URL` is not set)
 * **Tool handler functions** – one Python function per MCP tool
 * **`TOOLS`** – list of MCP tool descriptors with JSON schemas
 * **`handle_message(raw)`** – JSON-RPC 2.0 dispatcher
 
-#### Simulated Sensors
+#### Available Sensors
 
-| Sensor Key | Unit | Nominal Value |
+| Sensor Key | Unit | Stub Value |
 |---|---|---|
 | `reactor_power_mw` | MW | 100 |
 | `core_temperature_c` | °C | 700 |
 | `salt_flow_rate_kg_s` | kg/s | 250 |
 | `fuel_salt_level_pct` | % | 87.5 |
 | `coolant_salt_level_pct` | % | 91.2 |
-| `control_rod_position_pct` | % | 45 |
 | `neutron_flux_n_cm2_s` | n/cm²/s | 2.5 × 10¹³ |
 | `primary_loop_pressure_bar` | bar | 1.1 |
 | `heat_exchanger_outlet_c` | °C | 565 |
@@ -78,6 +90,9 @@ Core library.  Contains:
 | `tritium_production_rate_g_day` | g/day | 0.12 |
 | `off_gas_activity_bq_m3` | Bq/m³ | 3.8 × 10⁶ |
 
+When `MSR_PLANT_DATA_URL` is set, all read tools fetch from that URL instead of
+the stub.
+
 ### `msr_mcp_server_main.py`
 
 Entry point.  Reads newline-delimited JSON-RPC messages from **stdin**
@@ -85,7 +100,7 @@ and writes responses to **stdout**.  Log messages go to **stderr**.
 
 ### `msr_digital_twin_client.py`
 
-Python client class `MSRDigitalTwinClient`.  Spawns the server as a
+Python client class `MSRDataLayerClient`.  Spawns the server as a
 subprocess and wraps each MCP tool in a typed Python method.
 
 ### `msr_digital_twin_with_rag.py`
@@ -100,6 +115,7 @@ Enhanced multi-step RAG pipeline (inspired by
 | `EmbeddingEngine` | Abstract base for text → dense vector |
 | `RandomProjectionEmbeddingEngine` | Numpy random-projection fallback |
 | `OpenAIEmbeddingEngine` | OpenAI-compatible /embeddings API |
+| `LocalGPUEmbeddingEngine` | sentence-transformers local GPU engine |
 | `KnowledgeBase` | Persistent hybrid (dense + TF-IDF) store |
 | `SourceInsight` | LLM-generated summary, topics, key_facts |
 | `SubQuery` | One decomposed search term + instructions |
@@ -121,7 +137,7 @@ Enhanced multi-step RAG pipeline (inspired by
    …
 
 3. Synthesis
-   [partial answers + live reactor state] ──► LLM ──► final answer
+   [partial answers + live plant data] ──► LLM ──► final answer
 ```
 
 #### Knowledge base persistence
@@ -146,8 +162,8 @@ indexed sources.
 
 ### `get_reactor_status`
 
-Returns the current operational status, power level, and core
-temperature.
+Returns the current operational status, power level, core temperature, and
+data source identifier.
 
 **Input:** _(none)_
 
@@ -157,7 +173,8 @@ temperature.
   "status": "NOMINAL",
   "reactor_power_mw": 100.2,
   "core_temperature_c": 701.4,
-  "last_updated": "2026-03-09T06:00:00+00:00"
+  "last_updated": "2026-03-09T06:00:00+00:00",
+  "data_source": "external"
 }
 ```
 
@@ -190,25 +207,15 @@ Returns a map of every sensor with its value and unit.
 { "sensor_name": "reactor_power_mw", "last_n": 20 }
 ```
 
----
-
-### `set_control_rod_position`
-
-Adjusts the control rod insertion depth.  Power and neutron flux are
-scaled proportionally.
-
-**Input:**
-```json
-{ "position_pct": 60.0 }
-```
+Returns the last N readings stored in the in-memory session buffer (up to 100).
 
 ---
 
 ### `get_active_alarms`
 
-Returns all currently active alarms.
+Returns all currently active safety/operational alarms.
 
-**Alarm thresholds (automatic):**
+**Alarm thresholds (checked against live data):**
 
 | Sensor | Condition | Alarm ID |
 |---|---|---|
@@ -219,42 +226,66 @@ Returns all currently active alarms.
 
 ---
 
-### `acknowledge_alarm`
+### `get_data_source_info`
 
-**Input:**
-```json
-{ "alarm_id": "CORE_TEMP_HIGH" }
-```
-
----
-
-### `run_thermal_simulation`
-
-Steady-state thermal-hydraulic model using FLiBe salt properties.
-Estimates outlet temperature, thermal efficiency, and electrical output.
-
-**Input:**
-```json
-{ "power_mw": 100, "inlet_temp_c": 650, "flow_rate_kg_s": 250 }
-```
+Returns information about the active data source (external URL or stub) and
+its connectivity status.
 
 **Output example:**
 ```json
 {
-  "power_mw": 100,
-  "inlet_temp_c": 650.0,
-  "outlet_temp_c": 815.15,
-  "delta_t_c": 165.15,
-  "estimated_efficiency": 0.3379,
-  "estimated_electrical_output_mwe": 33.79
+  "mode": "external",
+  "url": "https://scada.example.com/api/plant/state",
+  "reachable": true,
+  "plant_status": "NOMINAL"
 }
 ```
 
 ---
 
+### `ingest_plant_data`
+
+Pushes operational data into the RAG knowledge base.
+
+**Input:**
+```json
+{
+  "content":   "Core temp 702°C at 14:32 UTC, flow 248 kg/s",
+  "data_type": "sensor_snapshot",
+  "source_id": "shift-log-2024-01-15-1432"
+}
+```
+
+`data_type` must be one of: `sensor_snapshot`, `event_log`,
+`maintenance_report`, `operational_data`.
+
+**Output example:**
+```json
+{
+  "source_id": "shift-log-2024-01-15-1432",
+  "chunks_added": 2
+}
+```
+
+---
+
+## What the Data Layer Does NOT Do
+
+The following capabilities are intentionally absent – they belong in a
+simulation tool or process-control system, not in the data layer:
+
+| Absent capability | Correct location |
+|---|---|
+| Thermal-hydraulic simulation | Digital twin / physics engine |
+| Control rod actuation | Plant control system |
+| Alarm acknowledgement | SCADA / DCS |
+| Transient calculation | Neutronics / thermalhydraulics solver |
+
+---
+
 ## Extending the Server
 
-### Adding a new tool
+### Adding a new read tool
 
 1. Write a handler function in `msr_mcp_server.py`.
 2. Add an entry to the `TOOLS` list with a JSON schema.
@@ -262,13 +293,21 @@ Estimates outlet temperature, thermal efficiency, and electrical output.
 
 ### Connecting to a real data source
 
-Replace the `_BASE_STATE` dictionary and the `_get_current_state()`
-function with calls to your SCADA historian, OPC-UA server, or database.
+Set `MSR_PLANT_DATA_URL` to the base URL of your SCADA historian, OPC-UA
+gateway, or digital twin REST API:
+
+```bash
+export MSR_PLANT_DATA_URL=https://your-scada.example.com/api/plant/state
+python msr_mcp_server_main.py
+```
+
+The API is expected to return a flat JSON object whose keys match the sensor
+names listed in the table above.
 
 ### Using a real vector database for RAG
 
-Replace `KnowledgeBase` with a ChromaDB or Qdrant client for large
-corpora (> 100 000 chunks).
+Replace `KnowledgeBase` with a ChromaDB or Qdrant client for large corpora
+(> 100 000 chunks).
 
 ---
 
