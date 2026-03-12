@@ -1,0 +1,570 @@
+"""
+MSR Knowledge Base Service – AWS Lambda Handler
+
+Exposes the MSR data layer MCP server and RAG knowledge base as an HTTPS
+service via AWS Lambda + API Gateway (HTTP API v2).  A single Lambda function
+handles all four concerns:
+
+1. **MCP endpoint** (``POST /mcp``) – full JSON-RPC 2.0 / MCP protocol so any
+   MCP-capable host (Claude, GitHub Copilot, custom agent) can talk to the
+   data layer tools over HTTPS instead of stdio.
+
+2. **Query endpoint** (``POST /query``) – simple REST wrapper around the RAG
+   pipeline so agents or operators can send a plain-text question and receive
+   a synthesised answer without implementing MCP.
+
+3. **Knowledge-base update endpoint** (``POST /kb/update``) – triggers
+   ingestion from the static msr-archive and/or the dynamic OpenAlex source.
+   Can also be invoked on a schedule via Amazon EventBridge (the same function
+   is the target; see ``template.yaml``).
+
+4. **Plant data ingestion endpoint** (``POST /data/ingest``) – accepts plant
+   operational data (sensor snapshots, event logs, maintenance reports) from
+   operators or agents and ingests it into the RAG knowledge base.
+
+5. **Health endpoint** (``GET /health``) – returns 200 with service metadata
+   for load-balancer checks and uptime monitoring.
+
+Knowledge Base Persistence
+--------------------------
+Lambda execution environments are ephemeral.  The KB files (``chunks.json``,
+``embeddings.npy``, ``insights.json``, ``tfidf.json``, plus loader state) are
+synced to an **S3 bucket** so they survive across invocations:
+
+* On cold start the function downloads all KB files from S3 to ``/tmp/kb_store``.
+* After every mutating operation (``/kb/update``, ``/data/ingest``, or
+  scheduled refresh) the updated files are uploaded back to S3.
+
+S3 sync is **optional** – if ``MSR_KB_S3_BUCKET`` is not set the function
+works entirely in ``/tmp`` (KB is rebuilt on every cold start from ``MSR_DOCS_DIR``
+or from scratch).
+
+In-memory warm-Lambda caching
+------------------------------
+The ``MSRDigitalTwinRAG`` instance is kept in a module-level variable and
+reused across requests served by the same warm Lambda container, avoiding
+repeated cold-start KB loading.
+
+Authentication
+--------------
+Set the ``MSR_API_KEY`` environment variable to enable simple bearer-token
+auth.  Requests must then include an ``X-Api-Key`` header matching that value.
+Leave the variable unset to disable authentication (useful for testing).
+
+Environment Variables
+---------------------
+MSR_KB_S3_BUCKET       S3 bucket name for KB persistence (no sync if unset)
+MSR_KB_S3_PREFIX       S3 key prefix (default: ``kb/``)
+MSR_API_KEY            Shared API key for request authentication (optional)
+MSR_PLANT_DATA_URL     URL of external plant data REST API (optional; when
+                       unset, the development stub is used for sensor reads)
+MSR_OPENAI_API_KEY     OpenAI key for LLM + embeddings
+MSR_OPENAI_BASE_URL    OpenAI-compatible API base URL
+MSR_OPENAI_MODEL       Chat model (default: gpt-4o-mini)
+MSR_EMBED_MODEL        Embedding model (default: text-embedding-3-small)
+MSR_DOCS_DIR           Local documents directory (default: /tmp/docs)
+MSR_USE_LOCAL_GPU      Set to ``true`` to use local GPU models for embeddings
+                       and response generation instead of the OpenAI API.
+                       Requires the GPU container image (see ``Dockerfile.gpu``).
+MSR_LOCAL_EMBED_MODEL  HuggingFace embedding model (default:
+                       ``sentence-transformers/all-MiniLM-L6-v2``)
+MSR_LOCAL_LLM_MODEL    HuggingFace generation model (default:
+                       ``TinyLlama/TinyLlama-1.1B-Chat-v1.0``)
+MSR_HF_CACHE_DIR       HuggingFace model cache (default: ``/tmp/hf_cache``)
+
+Deployment
+----------
+See ``template.yaml`` (AWS SAM), ``Dockerfile.gpu`` (GPU container), and
+``Makefile`` for build/deploy commands.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# ---------------------------------------------------------------------------
+# Optional boto3 (not available in local unit-test runs unless installed)
+# ---------------------------------------------------------------------------
+
+try:
+    import boto3  # type: ignore[import-untyped]
+    from botocore.exceptions import BotoCoreError, ClientError as S3ClientError  # type: ignore[import-untyped]
+    _BOTO3_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _BOTO3_AVAILABLE = False
+    BotoCoreError = Exception  # type: ignore[misc, assignment]
+    S3ClientError = Exception  # type: ignore[misc, assignment]
+
+# ---------------------------------------------------------------------------
+# Configuration constants
+# ---------------------------------------------------------------------------
+
+_KB_LOCAL_DIR = "/tmp/kb_store"
+_S3_BUCKET = os.environ.get("MSR_KB_S3_BUCKET", "")
+_S3_PREFIX = os.environ.get("MSR_KB_S3_PREFIX", "kb/").rstrip("/") + "/"
+_API_KEY = os.environ.get("MSR_API_KEY", "")
+
+# KB files that should be synced to/from S3
+_KB_FILES = [
+    "chunks.json",
+    "embeddings.npy",
+    "insights.json",
+    "tfidf.json",
+    "archive_state.json",
+    "openalex_state.json",
+    "plant_data_state.json",
+]
+
+# ---------------------------------------------------------------------------
+# Module-level warm-Lambda cache
+# ---------------------------------------------------------------------------
+
+_rag_cache: Any = None   # MSRDigitalTwinRAG instance
+
+
+# ---------------------------------------------------------------------------
+# S3 sync helpers
+# ---------------------------------------------------------------------------
+
+def _s3_client() -> Any:
+    return boto3.client("s3")  # type: ignore[attr-defined]
+
+
+def sync_kb_from_s3() -> None:
+    """
+    Download KB files from S3 to ``/tmp/kb_store``.
+
+    No-op when ``MSR_KB_S3_BUCKET`` is unset or boto3 is unavailable.
+    """
+    if not _S3_BUCKET or not _BOTO3_AVAILABLE:
+        return
+    kb_path = Path(_KB_LOCAL_DIR)
+    kb_path.mkdir(parents=True, exist_ok=True)
+    s3 = _s3_client()
+    for filename in _KB_FILES:
+        s3_key = f"{_S3_PREFIX}{filename}"
+        local_path = kb_path / filename
+        try:
+            s3.download_file(_S3_BUCKET, s3_key, str(local_path))
+            logger.info("KB sync: downloaded s3://%s/%s", _S3_BUCKET, s3_key)
+        except (S3ClientError, BotoCoreError) as exc:
+            # File may not exist yet (first run) – that's fine
+            logger.debug("KB sync: %s not in S3 yet (%s)", filename, exc)
+
+
+def sync_kb_to_s3() -> None:
+    """
+    Upload KB files from ``/tmp/kb_store`` to S3.
+
+    No-op when ``MSR_KB_S3_BUCKET`` is unset or boto3 is unavailable.
+    """
+    if not _S3_BUCKET or not _BOTO3_AVAILABLE:
+        return
+    kb_path = Path(_KB_LOCAL_DIR)
+    if not kb_path.is_dir():
+        return
+    s3 = _s3_client()
+    for filename in _KB_FILES:
+        local_path = kb_path / filename
+        if not local_path.exists():
+            continue
+        s3_key = f"{_S3_PREFIX}{filename}"
+        try:
+            s3.upload_file(str(local_path), _S3_BUCKET, s3_key)
+            logger.info("KB sync: uploaded s3://%s/%s", _S3_BUCKET, s3_key)
+        except (S3ClientError, BotoCoreError) as exc:
+            logger.warning("KB sync: failed to upload %s: %s", filename, exc)
+
+
+# ---------------------------------------------------------------------------
+# RAG instance (warm-Lambda cache)
+# ---------------------------------------------------------------------------
+
+def _get_rag() -> Any:
+    """
+    Return the module-level cached RAG instance, initialising it on first call.
+
+    Sets ``MSR_KB_DIR`` to ``/tmp/kb_store`` before construction so the KB
+    files end up in Lambda's ephemeral storage.
+    """
+    global _rag_cache  # noqa: PLW0603
+    if _rag_cache is None:
+        os.environ.setdefault("MSR_KB_DIR", _KB_LOCAL_DIR)
+        os.environ.setdefault("MSR_DOCS_DIR", "/tmp/docs")
+        sync_kb_from_s3()
+        from msr_digital_twin_with_rag import MSRDigitalTwinRAG  # noqa: PLC0415
+        _rag_cache = MSRDigitalTwinRAG()
+        logger.info("RAG instance initialised (warm cache).")
+    return _rag_cache
+
+
+# ---------------------------------------------------------------------------
+# Response helpers
+# ---------------------------------------------------------------------------
+
+def _response(
+    status: int,
+    body: Any,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    return {
+        "statusCode": status,
+        "headers": headers,
+        "body": json.dumps(body, indent=2),
+    }
+
+
+def _error(status: int, message: str) -> dict[str, Any]:
+    return _response(status, {"error": message})
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+def _is_authenticated(event: dict[str, Any]) -> bool:
+    """Return True if the request carries a valid API key (or auth is disabled)."""
+    if not _API_KEY:
+        return True  # Auth disabled
+    headers = event.get("headers") or {}
+    # API Gateway v2 lower-cases header names
+    provided = (
+        headers.get("x-api-key")
+        or headers.get("X-Api-Key")
+        or headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    )
+    return provided == _API_KEY
+
+
+# ---------------------------------------------------------------------------
+# Request body parsing (supports base64-encoded bodies from API Gateway)
+# ---------------------------------------------------------------------------
+
+def _parse_body(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """
+    Return *(raw_str, parsed_dict)* from the Lambda event body.
+
+    Handles base64-encoded bodies (binary payloads via API Gateway).
+    """
+    raw = event.get("body") or ""
+    if event.get("isBase64Encoded") and raw:
+        try:
+            raw = base64.b64decode(raw).decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            raw = ""
+    parsed: dict[str, Any] = {}
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+    return raw, parsed
+
+
+# ---------------------------------------------------------------------------
+# Route handlers
+# ---------------------------------------------------------------------------
+
+def _handle_health() -> dict[str, Any]:
+    """``GET /health`` – service liveness check."""
+    from msr_mcp_server import _get_current_state, get_data_source_info  # noqa: PLC0415
+    from msr_digital_twin_with_rag import _gpu_device, _TORCH_AVAILABLE  # noqa: PLC0415
+    state = _get_current_state()
+    ds_info = get_data_source_info()
+    # Include current plant status in the data_source info block
+    ds_info["plant_status"] = state.get("status", "UNKNOWN")
+    use_local_gpu = os.environ.get("MSR_USE_LOCAL_GPU", "").lower() in ("1", "true", "yes")
+    return _response(200, {
+        "service": "msr-knowledge-base",
+        "version": "1.0.0",
+        "status": "healthy",
+        "data_source": ds_info,
+        "kb_dir": _KB_LOCAL_DIR,
+        "s3_bucket": _S3_BUCKET or "(not configured)",
+        "gpu": {
+            "torch_available": _TORCH_AVAILABLE,
+            "device": _gpu_device() if _TORCH_AVAILABLE else "cpu",
+            "local_gpu_mode": use_local_gpu,
+            "embed_model": os.environ.get(
+                "MSR_LOCAL_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+            ) if use_local_gpu else None,
+            "llm_model": os.environ.get(
+                "MSR_LOCAL_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+            ) if use_local_gpu else None,
+        },
+    })
+
+
+def _handle_mcp(raw_body: str) -> dict[str, Any]:
+    """
+    ``POST /mcp`` – MCP JSON-RPC 2.0 endpoint.
+
+    Accepts a single MCP message (JSON-RPC 2.0 object) and returns the
+    server's response.  MCP-capable hosts (Claude Desktop, VS Code Copilot,
+    custom agents) can point to this URL instead of the stdio transport.
+    """
+    if not raw_body.strip():
+        return _error(400, "Request body must be a JSON-RPC 2.0 message.")
+    from msr_mcp_server import handle_message  # noqa: PLC0415
+    response_str = handle_message(raw_body)
+    if not response_str:
+        return _response(204, {})
+    try:
+        return _response(200, json.loads(response_str))
+    except json.JSONDecodeError:
+        return _response(200, {"raw": response_str})
+
+
+def _handle_query(body: dict[str, Any]) -> dict[str, Any]:
+    """
+    ``POST /query`` – RAG query endpoint.
+
+    Request body::
+
+        {
+          "question": "What is the thermal efficiency of TMSR-LF1?",
+          "top_k": 5          // optional, default 5
+        }
+
+    Response::
+
+        {
+          "question": "...",
+          "answer": "...",
+          "top_k": 5
+        }
+    """
+    question = body.get("question", "").strip()
+    if not question:
+        return _error(400, "Request body must include a non-empty 'question' field.")
+    top_k = int(body.get("top_k", 5))
+    top_k = max(1, min(top_k, 20))
+    rag = _get_rag()
+    try:
+        answer = rag.answer(question, top_k=top_k)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("RAG query failed")
+        return _error(500, f"RAG query failed: {exc}")
+    return _response(200, {
+        "question": question,
+        "answer": answer,
+        "top_k": top_k,
+    })
+
+
+def _handle_plant_data_ingest(body: dict[str, Any]) -> dict[str, Any]:
+    """
+    ``POST /data/ingest`` – ingest plant operational data into the KB.
+
+    Request body::
+
+        {
+          "content":   "Core temp 702°C at 14:32 UTC, flow 248 kg/s",
+          "data_type": "sensor_snapshot",  // optional, default "operational_data"
+          "source_id": "shift-log-2024-01-15-1432"  // optional, auto-generated if absent
+        }
+
+    ``content`` can also be a JSON-encoded sensor snapshot or event log.
+
+    Response::
+
+        {
+          "source_id":    "shift-log-2024-01-15-1432",
+          "data_type":    "sensor_snapshot",
+          "chunks_added": 2
+        }
+    """
+    content = (body.get("content") or "").strip()
+    if not content:
+        return _error(400, "Request body must include a non-empty 'content' field.")
+
+    data_type = (body.get("data_type") or "operational_data").strip()
+    valid_types = {"sensor_snapshot", "event_log", "maintenance_report", "operational_data"}
+    if data_type not in valid_types:
+        return _error(
+            400,
+            f"data_type must be one of: {', '.join(sorted(valid_types))}."
+        )
+
+    source_id = (body.get("source_id") or "").strip()
+    if not source_id:
+        import time  # noqa: PLC0415
+        source_id = f"{data_type}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+
+    rag = _get_rag()
+    try:
+        from msr_kb_sources import PlantDataLoader  # noqa: PLC0415
+        loader = PlantDataLoader()
+        chunks_added = loader.ingest_text(rag, content, source_id, data_type=data_type)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Plant data ingestion failed")
+        return _error(500, f"Ingestion failed: {exc}")
+
+    # Persist updated KB back to S3
+    sync_kb_to_s3()
+
+    return _response(200, {
+        "source_id": source_id,
+        "data_type": data_type,
+        "chunks_added": chunks_added,
+    })
+
+
+def _handle_kb_update(body: dict[str, Any]) -> dict[str, Any]:
+    """
+    ``POST /kb/update`` – trigger KB ingestion from one or both sources.
+
+    Request body::
+
+        {
+          "source": "archive" | "openalex" | "all",   // default: "all"
+          "max_docs": 20                                // optional
+        }
+
+    Response::
+
+        {
+          "source": "all",
+          "added": {"archive": 5, "openalex": 3}
+        }
+    """
+    source = body.get("source", "all").lower().strip()
+    if source not in ("archive", "openalex", "all"):
+        return _error(400, "source must be 'archive', 'openalex', or 'all'.")
+    max_docs_raw = body.get("max_docs", 0)
+    try:
+        max_docs = int(max_docs_raw)
+    except (TypeError, ValueError):
+        max_docs = 0
+
+    rag = _get_rag()
+    added: dict[str, int] = {}
+    try:
+        if source in ("archive", "all"):
+            added["archive"] = rag.load_msr_archive(max_docs=max_docs)
+        if source in ("openalex", "all"):
+            added["openalex"] = rag.update_openalex(
+                max_docs=max_docs or None
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("KB update failed")
+        return _error(500, f"KB update failed: {exc}")
+
+    # Persist updated KB back to S3
+    sync_kb_to_s3()
+
+    total = sum(added.values())
+    return _response(200, {
+        "source": source,
+        "added": added,
+        "total_new_documents": total,
+    })
+
+
+def _handle_scheduled_kb_update(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Handle an Amazon EventBridge scheduled invocation.
+
+    Triggers a full KB update (both archive + OpenAlex) and persists to S3.
+    The function returns a dict that EventBridge ignores but is visible in
+    CloudWatch Logs.
+    """
+    logger.info("Scheduled KB update triggered by EventBridge.")
+    rag = _get_rag()
+    added: dict[str, int] = {}
+    try:
+        added["archive"] = rag.load_msr_archive()
+        added["openalex"] = rag.update_openalex()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Scheduled KB update failed")
+        return {"success": False, "error": str(exc)}
+    sync_kb_to_s3()
+    logger.info("Scheduled KB update complete: %s", added)
+    return {"success": True, "added": added}
+
+
+# ---------------------------------------------------------------------------
+# API Gateway event router
+# ---------------------------------------------------------------------------
+
+def _route_http(event: dict[str, Any]) -> dict[str, Any]:
+    """Route an API Gateway HTTP API v2 (or v1) event to the right handler."""
+    # API Gateway v2 uses requestContext.http; v1 uses httpMethod + path
+    rc = event.get("requestContext", {})
+    http_ctx = rc.get("http", {})
+    method = (http_ctx.get("method") or event.get("httpMethod") or "GET").upper()
+    path = event.get("rawPath") or event.get("path") or "/"
+
+    # Strip trailing slash for normalisation (keep root "/")
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+
+    if not _is_authenticated(event):
+        return _error(403, "Forbidden: invalid or missing X-Api-Key header.")
+
+    raw_body, parsed_body = _parse_body(event)
+
+    # Health / root
+    if path in ("/health", "/") and method == "GET":
+        return _handle_health()
+
+    # MCP JSON-RPC endpoint
+    if path == "/mcp" and method == "POST":
+        return _handle_mcp(raw_body)
+
+    # RAG query endpoint
+    if path == "/query" and method == "POST":
+        return _handle_query(parsed_body)
+
+    # KB update endpoint
+    if path == "/kb/update" and method == "POST":
+        return _handle_kb_update(parsed_body)
+
+    # Plant data ingestion endpoint
+    if path == "/data/ingest" and method == "POST":
+        return _handle_plant_data_ingest(parsed_body)
+
+    return _error(404, f"Not found: {method} {path}")
+
+
+# ---------------------------------------------------------------------------
+# Lambda entry point
+# ---------------------------------------------------------------------------
+
+def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    """
+    AWS Lambda entry point.
+
+    Handles two invocation types:
+
+    * **HTTP (API Gateway)** – routes by path/method (see :func:`_route_http`).
+    * **Scheduled (EventBridge)** – triggers a full KB update
+      (``event["source"] == "aws.events"``).
+    """
+    # EventBridge scheduled trigger
+    if event.get("source") == "aws.events" or event.get("detail-type") == "Scheduled Event":
+        return _handle_scheduled_kb_update(event)
+
+    # HTTP API Gateway (v2 or v1)
+    if "requestContext" in event or "httpMethod" in event:
+        return _route_http(event)
+
+    # Direct Lambda invocation with a plain dict (e.g. from another Lambda)
+    return _route_http({
+        "requestContext": {"http": {"method": event.get("method", "POST")}},
+        "rawPath": event.get("path", "/query"),
+        "body": json.dumps(event),
+        "isBase64Encoded": False,
+        "headers": event.get("headers", {}),
+    })

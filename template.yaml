@@ -1,0 +1,449 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  MSR Knowledge Base Service
+
+  Deploys the MSR digital twin MCP server and RAG knowledge base as a
+  serverless HTTPS service on AWS Lambda.  Exposes four HTTP endpoints:
+
+    GET  /health      – liveness check
+    POST /mcp         – MCP JSON-RPC 2.0 (for MCP-compatible agents)
+    POST /query       – simple plain-text RAG query
+    POST /kb/update   – trigger KB ingestion (archive + OpenAlex)
+
+  A separate EventBridge rule runs the KB updater on a daily schedule.
+
+# ---------------------------------------------------------------------------
+# SAM/CloudFormation Parameters
+# ---------------------------------------------------------------------------
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment name (used in resource names/tags).
+
+  OpenAIApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      OpenAI API key for LLM + embeddings.  Leave blank to use the
+      random-projection embedding engine (no LLM synthesis).
+
+  MsrApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Shared API key for request authentication (X-Api-Key header).
+      Leave blank to disable authentication (not recommended for production).
+
+  OpenAlexEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Email address for the OpenAlex polite-pool header.  Increases rate
+      limits.  Leave blank to omit the header.
+
+  GithubToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      GitHub personal access token for the msr-archive fetcher.  Increases
+      the API rate limit from 60 to 5 000 requests/hr.  Optional.
+
+  OpenAlexMaxResults:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+    Description: Maximum number of OpenAlex papers ingested per scheduled run.
+
+  KBUpdateSchedule:
+    Type: String
+    Default: "rate(1 day)"
+    Description: >
+      EventBridge schedule expression for periodic KB updates.
+      Examples: "rate(1 day)", "cron(0 2 * * ? *)" (daily at 02:00 UTC).
+
+  PlantDataUrl:
+    Type: String
+    Default: ""
+    Description: >
+      URL of the external plant data REST API (SCADA, historian, or digital
+      twin API).  When a GET request to this URL returns a JSON object of
+      sensor key/value pairs, it will be used for live data reads.
+      Leave blank to use the development stub.
+
+  UseLocalGPU:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Set to "true" to deploy the GPU container variant
+      (MSRKBGPUFunction) which uses local sentence-transformers and a
+      HuggingFace causal-LM instead of the OpenAI API.
+      The GPU container image must be built and pushed to ECR first
+      (see Makefile: make build-gpu-container push-gpu-container).
+      NOTE: AWS Lambda does not currently support GPU instances.
+      The GPU container is intended for ECS/EKS/EC2 deployments.
+
+  GPUContainerImageUri:
+    Type: String
+    Default: ""
+    Description: >
+      ECR image URI for the GPU-capable container
+      (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/msr-kb-gpu:latest).
+      Required when UseLocalGPU is "true".
+
+  LocalEmbedModel:
+    Type: String
+    Default: "sentence-transformers/all-MiniLM-L6-v2"
+    Description: HuggingFace model ID for local GPU embeddings.
+
+  LocalLLMModel:
+    Type: String
+    Default: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    Description: HuggingFace model ID for local GPU text generation.
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+
+Conditions:
+  DeployGPUFunction: !And
+    - !Equals [!Ref UseLocalGPU, "true"]
+    - !Not [!Equals [!Ref GPUContainerImageUri, ""]]
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      # x86_64: numpy binaries require a matching architecture.
+      # Switch to arm64 only if building on Graviton (requires separate sam build).
+      - x86_64
+    MemorySize: 1024    # 1 GB – numpy dense embedding matrix benefits from RAM
+    Timeout: 900        # 15 minutes – max Lambda timeout (for initial KB load)
+    Tracing: Active     # AWS X-Ray
+    Layers:
+      []                # Add Lambda layers here if needed (e.g. custom numpy)
+    Environment:
+      Variables:
+        MSR_KB_DIR: /tmp/kb_store
+        MSR_DOCS_DIR: /tmp/docs
+        MSR_KB_S3_BUCKET: !Ref KBStoreBucket
+        MSR_KB_S3_PREFIX: !Sub "kb-${Environment}/"
+        MSR_OPENAI_API_KEY: !Ref OpenAIApiKey
+        MSR_API_KEY: !Ref MsrApiKey
+        MSR_OPENALEX_EMAIL: !Ref OpenAlexEmail
+        MSR_GITHUB_TOKEN: !Ref GithubToken
+        MSR_OPENALEX_MAX_RESULTS: !Ref OpenAlexMaxResults
+        MSR_PLANT_DATA_URL: !Ref PlantDataUrl
+        POWERTOOLS_SERVICE_NAME: msr-kb-service
+        LOG_LEVEL: INFO
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+
+Resources:
+
+  # -----------------------------------------------------------------------
+  # S3 bucket – persistent KB storage
+  # -----------------------------------------------------------------------
+
+  KBStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "msr-kb-store-${AWS::AccountId}-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled       # keeps previous KB snapshots
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: msr-data-layer
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -----------------------------------------------------------------------
+  # HTTP API Gateway
+  # -----------------------------------------------------------------------
+
+  MSRHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      Description: MSR Knowledge Base Service API
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - X-Api-Key
+          - Authorization
+        MaxAge: 300
+      Tags:
+        Project: msr-data-layer
+        Environment: !Ref Environment
+
+  # -----------------------------------------------------------------------
+  # Main Lambda function – serves HTTP requests
+  # -----------------------------------------------------------------------
+
+  MSRKBFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "msr-kb-service-${Environment}"
+      Description: MSR Knowledge Base Service (MCP + RAG query + KB update)
+      CodeUri: .
+      Handler: lambda_function.lambda_handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref KBStoreBucket
+        - CloudWatchLogsFullAccess
+      Events:
+        # ── HTTP routes ──────────────────────────────────────────────────
+        HealthCheck:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /health
+            Method: GET
+        MCPEndpoint:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /mcp
+            Method: POST
+        QueryEndpoint:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /query
+            Method: POST
+        KBUpdateEndpoint:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /kb/update
+            Method: POST
+        PlantDataIngestEndpoint:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /data/ingest
+            Method: POST
+        # ── Scheduled KB refresh (EventBridge) ──────────────────────────
+        ScheduledKBUpdate:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref KBUpdateSchedule
+            Name: !Sub "msr-kb-daily-update-${Environment}"
+            Description: Periodic KB refresh from msr-archive and OpenAlex
+            Enabled: true
+            Input: |
+              {
+                "source": "aws.events",
+                "detail-type": "Scheduled Event",
+                "detail": "periodic-kb-update"
+              }
+      Tags:
+        Project: msr-data-layer
+        Environment: !Ref Environment
+
+  # -----------------------------------------------------------------------
+  # CloudWatch Log Group (explicit so retention is set)
+  # -----------------------------------------------------------------------
+
+  MSRKBFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/msr-kb-service-${Environment}"
+      RetentionInDays: 30
+
+  # -----------------------------------------------------------------------
+  # GPU container Lambda function (optional; requires ECR image)
+  # -----------------------------------------------------------------------
+  # AWS Lambda does not currently support GPU instances.  This function
+  # definition is provided so the GPU container image can be deployed as a
+  # standard Lambda function today (CPU inference) and will automatically
+  # take advantage of GPU hardware when Lambda adds GPU support.
+  #
+  # For GPU inference NOW, deploy the same container image to:
+  #   - Amazon ECS with the NVIDIA Container Toolkit
+  #   - AWS Batch GPU compute environments
+  #   - EC2 G/P instances running the Lambda Runtime Interface Emulator
+  #
+  # Condition: only created when UseLocalGPU == "true" AND a container
+  # image URI is provided.
+
+  MSRKBGPUFunction:
+    Type: AWS::Serverless::Function
+    Condition: DeployGPUFunction
+    Properties:
+      FunctionName: !Sub "msr-kb-service-gpu-${Environment}"
+      Description: >
+        MSR Knowledge Base Service – GPU container variant.
+        Uses local sentence-transformers + HuggingFace LLM instead of OpenAI API.
+      PackageType: Image
+      ImageUri: !Ref GPUContainerImageUri
+      MemorySize: 10240   # 10 GB – maximum Lambda memory; fits LLM weights
+      Timeout: 900
+      Tracing: Active
+      Architectures:
+        - x86_64
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref KBStoreBucket
+        - CloudWatchLogsFullAccess
+      Environment:
+        Variables:
+          MSR_USE_LOCAL_GPU: "true"
+          MSR_LOCAL_EMBED_MODEL: !Ref LocalEmbedModel
+          MSR_LOCAL_LLM_MODEL: !Ref LocalLLMModel
+          MSR_HF_CACHE_DIR: /opt/hf_models
+          MSR_KB_DIR: /tmp/kb_store
+          MSR_DOCS_DIR: /tmp/docs
+          MSR_KB_S3_BUCKET: !Ref KBStoreBucket
+          MSR_KB_S3_PREFIX: !Sub "kb-gpu-${Environment}/"
+          MSR_API_KEY: !Ref MsrApiKey
+          MSR_OPENALEX_EMAIL: !Ref OpenAlexEmail
+          MSR_GITHUB_TOKEN: !Ref GithubToken
+          POWERTOOLS_SERVICE_NAME: msr-kb-service-gpu
+          LOG_LEVEL: INFO
+      Events:
+        HealthCheckGPU:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /gpu/health
+            Method: GET
+        MCPEndpointGPU:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /gpu/mcp
+            Method: POST
+        QueryEndpointGPU:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /gpu/query
+            Method: POST
+        KBUpdateEndpointGPU:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /gpu/kb/update
+            Method: POST
+        PlantDataIngestEndpointGPU:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MSRHttpApi
+            Path: /gpu/data/ingest
+            Method: POST
+        ScheduledKBUpdateGPU:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref KBUpdateSchedule
+            Name: !Sub "msr-kb-gpu-daily-update-${Environment}"
+            Description: Periodic KB refresh (GPU function)
+            Enabled: true
+            Input: |
+              {
+                "source": "aws.events",
+                "detail-type": "Scheduled Event",
+                "detail": "periodic-kb-update-gpu"
+              }
+      Tags:
+        Project: msr-data-layer
+        Environment: !Ref Environment
+        GPUMode: "true"
+
+  MSRKBGPUFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployGPUFunction
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/msr-kb-service-gpu-${Environment}"
+      RetentionInDays: 30
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL for the MSR Knowledge Base Service
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "msr-kb-api-url-${Environment}"
+
+  HealthEndpoint:
+    Description: Health-check URL
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/health"
+
+  MCPEndpoint:
+    Description: MCP JSON-RPC 2.0 endpoint
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/mcp"
+
+  QueryEndpoint:
+    Description: Plain-text RAG query endpoint
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/query"
+
+  KBUpdateEndpoint:
+    Description: Knowledge-base update endpoint
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/kb/update"
+
+  PlantDataIngestEndpoint:
+    Description: Plant operational data ingestion endpoint
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/data/ingest"
+
+  KBStoreBucketName:
+    Description: S3 bucket storing the persistent knowledge base
+    Value: !Ref KBStoreBucket
+    Export:
+      Name: !Sub "msr-kb-bucket-${Environment}"
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt MSRKBFunction.Arn
+
+  GPUQueryEndpoint:
+    Description: GPU-accelerated plain-text RAG query endpoint (when DeployGPUFunction=true)
+    Condition: DeployGPUFunction
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/gpu/query"
+
+  GPUMCPEndpoint:
+    Description: GPU-accelerated MCP JSON-RPC 2.0 endpoint (when DeployGPUFunction=true)
+    Condition: DeployGPUFunction
+    Value: !Sub "https://${MSRHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/gpu/mcp"
+
+  GPULambdaFunctionArn:
+    Description: ARN of the GPU Lambda function (when DeployGPUFunction=true)
+    Condition: DeployGPUFunction
+    Value: !GetAtt MSRKBGPUFunction.Arn

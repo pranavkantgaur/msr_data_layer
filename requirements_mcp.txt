@@ -1,0 +1,22 @@
+# MSR Data Layer – MCP server dependencies
+
+# Model Context Protocol transport (stdio / SSE)
+# The MCP server in this repo is implemented without an external MCP SDK
+# so that it works with standard Python 3.10+.  No additional MCP package
+# is required for the core server.
+
+# Optional: uncomment to use the official Anthropic MCP Python SDK instead
+# mcp>=1.0.0
+
+# OpenAI-compatible client (used by the RAG module when MSR_OPENAI_API_KEY
+# is set).  The implementation falls back to urllib.request (stdlib) so
+# this dependency is optional.
+# openai>=1.0.0
+
+# Dense vector embeddings (used by the enhanced RAG module for hybrid
+# dense+sparse retrieval and the random-projection embedding engine)
+numpy>=1.24.0
+
+# Testing
+pytest>=8.0.0
+
