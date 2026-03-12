@@ -23,6 +23,7 @@ data-layer capability, providing:
 | [cantor_1968_fluoride_salt_properties.md](cantor_1968_fluoride_salt_properties.md) | Cantor et al., ORNL-4229 | Physical properties of MSR fuel, coolant and flush salts | 1968 |
 | [mccoy_1970_tellurium_embrittlement.md](mccoy_1970_tellurium_embrittlement.md) | McCoy et al., *Nucl. Appl. Technol.* | Tellurium-induced intergranular cracking of Hastelloy N | 1970 |
 | [baes_1974_redox_chemistry.md](baes_1974_redox_chemistry.md) | Baes, *J. Nucl. Mater.* | Redox chemistry and UF₃/UF₄ control in FLiBe fuel salt | 1974 |
+| [bettis_robertson_1970_thorium_breeding_fuel_cycle.md](bettis_robertson_1970_thorium_breeding_fuel_cycle.md) | Bettis & Robertson, *Nucl. Appl. & Tech.* | Thorium breeding cycle, Pa-233 management, and online fuel processing for Copenhagen Atomics' WATT reactor | 1970 |
 
 ---
 
