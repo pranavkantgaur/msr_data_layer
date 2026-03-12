@@ -413,18 +413,13 @@ The `GITHUB_TOKEN` secret is injected automatically into every Codespace.
 call `https://models.inference.ai.azure.com` – the same OpenAI-compatible
 endpoint used by GitHub Copilot Chat.
 
-<<<<<<< HEAD
 ### Deploy in 4 steps
-=======
-### Deploy in 5 steps
->>>>>>> e9e1aa9 (feat: deploy MSR data layer via GitHub Codespaces with GitHub Models API)
 
 **Step 1 – Open a Codespace**
 
 Go to your fork of this repository on GitHub, click **Code → Codespaces →
 Create codespace on main** (or your working branch).  The
 `.devcontainer/devcontainer.json` configuration installs Python dependencies
-<<<<<<< HEAD
 and starts `server.py` automatically when the Codespace boots.  Port 8000 is
 marked as **public** automatically, so no extra "Make Public" step is needed.
 
@@ -449,37 +444,12 @@ port **8000 – MSR Data Layer API**.  Its public URL is:
 
 ```
 https://<codespace-name>-8000.app.github.dev
-=======
-and starts `server.py` automatically when the Codespace boots.
-
-**Step 2 – Wait for the server to start**
-
-The terminal will print:
-
-```
-MSR Data Layer HTTP server listening on http://0.0.0.0:8000
-Endpoints: GET /health  POST /mcp  POST /query  POST /kb/update  POST /data/ingest
-```
-
-**Step 3 – Make port 8000 public**
-
-In VS Code (inside the Codespace), open the **Ports** panel, right-click
-**port 8000**, and select **Port Visibility → Public**.  You will get a URL
-like:
-
-```
-https://<codespace-name>-8000.preview.app.github.dev
->>>>>>> e9e1aa9 (feat: deploy MSR data layer via GitHub Codespaces with GitHub Models API)
 ```
 
 **Step 4 – Query the data layer**
 
 ```bash
-<<<<<<< HEAD
 BASE_URL="https://<codespace-name>-8000.app.github.dev"
-=======
-BASE_URL="https://<codespace-name>-8000.preview.app.github.dev"
->>>>>>> e9e1aa9 (feat: deploy MSR data layer via GitHub Codespaces with GitHub Models API)
 
 # Health check
 curl "$BASE_URL/health"
@@ -507,13 +477,9 @@ If the server is not running (e.g. after the Codespace was paused), restart it
 from the terminal:
 
 ```bash
-<<<<<<< HEAD
 bash .devcontainer/start-server.sh
 # Stops any previous instance, starts a fresh one with nohup.
 # Logs: /tmp/msr_server.log   PID: /tmp/msr_server.pid
-=======
-python server.py --host 0.0.0.0 --port 8000
->>>>>>> e9e1aa9 (feat: deploy MSR data layer via GitHub Codespaces with GitHub Models API)
 ```
 
 ### Environment variables

@@ -7,27 +7,17 @@
   // ---------------------------------------------------------------------------
   // Port forwarding
   // Port 8000 is the MSR Data Layer HTTP server (server.py).
-<<<<<<< HEAD
   // "visibility": "public" makes the URL publicly accessible automatically –
   // no manual "Make Public" step needed.  The URL will be:
   //   https://<codespace-name>-8000.app.github.dev
-=======
-  // After the Codespace starts, go to the Ports panel in VS Code, right-click
-  // port 8000 and choose "Make Public" to get a publicly accessible HTTPS URL:
-  //   https://<codespace-name>-8000.preview.app.github.dev
->>>>>>> e9e1aa9 (feat: deploy MSR data layer via GitHub Codespaces with GitHub Models API)
   // ---------------------------------------------------------------------------
   "forwardPorts": [8000],
   "portsAttributes": {
     "8000": {
       "label": "MSR Data Layer API",
       "protocol": "http",
-<<<<<<< HEAD
       "onAutoForward": "openBrowserOnce",
       "visibility": "public"
-=======
-      "onAutoForward": "notify"
->>>>>>> e9e1aa9 (feat: deploy MSR data layer via GitHub Codespaces with GitHub Models API)
     }
   },
 
@@ -35,7 +25,6 @@
   "postCreateCommand": "pip install --quiet -r requirements_mcp.txt",
 
   // Start the HTTP server when the Codespace session begins.
-<<<<<<< HEAD
   // Uses .devcontainer/start-server.sh which calls nohup so the process
   // survives after the postStartCommand shell exits (plain "&" would not).
   // GITHUB_TOKEN is injected automatically by Codespaces; server.py forwards
@@ -43,12 +32,6 @@
   // (gpt-4o-mini + text-embedding-3-small) at no extra cost.
   // Logs: /tmp/msr_server.log   PID: /tmp/msr_server.pid
   "postStartCommand": "bash .devcontainer/start-server.sh",
-=======
-  // GITHUB_TOKEN is injected automatically by Codespaces; server.py forwards
-  // it to MSR_GITHUB_TOKEN so the RAG pipeline uses the GitHub Models API
-  // (gpt-4o-mini + text-embedding-3-small) at no extra cost.
-  "postStartCommand": "python server.py --host 0.0.0.0 --port 8000 &",
->>>>>>> e9e1aa9 (feat: deploy MSR data layer via GitHub Codespaces with GitHub Models API)
 
   // ---------------------------------------------------------------------------
   // Environment variables
