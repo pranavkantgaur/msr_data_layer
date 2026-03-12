@@ -24,34 +24,6 @@ data-layer capability, providing:
 | [mccoy_1970_tellurium_embrittlement.md](mccoy_1970_tellurium_embrittlement.md) | McCoy et al., *Nucl. Appl. Technol.* | Tellurium-induced intergranular cracking of Hastelloy N | 1970 |
 | [baes_1974_redox_chemistry.md](baes_1974_redox_chemistry.md) | Baes, *J. Nucl. Mater.* | Redox chemistry and UF₃/UF₄ control in FLiBe fuel salt | 1974 |
 | [bettis_robertson_1970_thorium_breeding_fuel_cycle.md](bettis_robertson_1970_thorium_breeding_fuel_cycle.md) | Bettis & Robertson, *Nucl. Appl. & Tech.* | Thorium breeding cycle, Pa-233 management, and online fuel processing for Copenhagen Atomics' WATT reactor | 1970 |
-| [nrc_2017_msr_regulatory_challenges.md](nrc_2017_msr_regulatory_challenges.md) | NRC Staff, ADAMS ML17331B126 | Regulatory challenges for MSR licensing — LBEs, source term, materials qualification, QA records, safeguards | 2017 |
-| [xue_2026_prhrs_transient_evaluation.md](xue_2026_prhrs_transient_evaluation.md) | Xue S. et al., *Ann. Nucl. Energy* | Transient performance evaluation of passive residual heat removal system in liquid molten salt reactor (RELAP5-TMSR) | 2026 |
-| [yang_2025_msp_pump_thermal_optimisation.md](yang_2025_msp_pump_thermal_optimisation.md) | Yang J. et al., SINAP/CAS | Thermal resistance optimisation of high-temperature molten salt pump via RSM and NSGA-II (10.3 °C bearing temperature reduction) | 2025 |
-| [wang_2026_resta3d_tmsr_transient_safety.md](wang_2026_resta3d_tmsr_transient_safety.md) | Wang K. et al., SINAP/CAS, *Ann. Nucl. Energy* | RESTA-3D reactor dynamics code with DNP transport and N-TH coupling — validation against MSRE and 2 MWth TMSR transient safety analysis | 2026 |
-
----
-
-## Physical AI Foundation-Model Training Use Cases
-
-The [`physical_ai/`](physical_ai/) subfolder contains use cases showing how
-the data layer supplies training data for foundation models powering the
-12 robotic operational areas of the
-[MSR Physical AI Layer](https://github.com/pranavkantgaur/msr_physical_ai_layer):
-
-| Rank | File | Robot | Area |
-|------|------|-------|------|
-| 1 | [physical_ai/01_primary_loop_maintenance_repair.md](physical_ai/01_primary_loop_maintenance_repair.md) | PLMR-01 | Primary loop maintenance & repair |
-| 2 | [physical_ai/02_hot_cell_chemical_processing.md](physical_ai/02_hot_cell_chemical_processing.md) | HCPR-01 | Hot-cell chemical processing automation |
-| 3 | [physical_ai/03_salt_sampling_analysis.md](physical_ai/03_salt_sampling_analysis.md) | SSR-01 | Salt sampling & analysis |
-| 4 | [physical_ai/04_radiation_mapping_inspection.md](physical_ai/04_radiation_mapping_inspection.md) | RMR-01 | Radiation mapping & autonomous inspection |
-| 5 | [physical_ai/05_freeze_plug_safety_monitoring.md](physical_ai/05_freeze_plug_safety_monitoring.md) | FPMR-01 | Freeze plug safety monitoring |
-| 6 | [physical_ai/06_fuel_salt_transport_refilling.md](physical_ai/06_fuel_salt_transport_refilling.md) | FSTR-01 | Fuel salt transport & refilling |
-| 7 | [physical_ai/07_graphite_moderator_inspection.md](physical_ai/07_graphite_moderator_inspection.md) | GIR-01 | Graphite moderator inspection & replacement |
-| 8 | [physical_ai/08_tritium_management.md](physical_ai/08_tritium_management.md) | TMR-01 | Tritium management systems |
-| 9 | [physical_ai/09_off_gas_system_handling.md](physical_ai/09_off_gas_system_handling.md) | OGSR-01 | Off-gas system handling |
-| 10 | [physical_ai/10_waste_salt_handling_solidification.md](physical_ai/10_waste_salt_handling_solidification.md) | WSHR-01 | Waste salt handling & solidification |
-| 11 | [physical_ai/11_external_structural_inspection.md](physical_ai/11_external_structural_inspection.md) | SIR-01 | External structural inspection |
-| 12 | [physical_ai/12_security_safeguards_monitoring.md](physical_ai/12_security_safeguards_monitoring.md) | SPR-01 | Security & safeguards monitoring |
 
 ---
 
