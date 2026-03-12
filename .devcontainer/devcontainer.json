@@ -1,0 +1,77 @@
+{
+  "name": "MSR Data Layer",
+
+  // Python 3.12 dev container image (Microsoft-maintained, no extra cost)
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+
+  // ---------------------------------------------------------------------------
+  // Port forwarding
+  // Port 8000 is the MSR Data Layer HTTP server (server.py).
+  // After the Codespace starts, go to the Ports panel in VS Code, right-click
+  // port 8000 and choose "Make Public" to get a publicly accessible HTTPS URL:
+  //   https://<codespace-name>-8000.preview.app.github.dev
+  // ---------------------------------------------------------------------------
+  "forwardPorts": [8000],
+  "portsAttributes": {
+    "8000": {
+      "label": "MSR Data Layer API",
+      "protocol": "http",
+      "onAutoForward": "notify"
+    }
+  },
+
+  // Install Python dependencies on container creation
+  "postCreateCommand": "pip install --quiet -r requirements_mcp.txt",
+
+  // Start the HTTP server when the Codespace session begins.
+  // GITHUB_TOKEN is injected automatically by Codespaces; server.py forwards
+  // it to MSR_GITHUB_TOKEN so the RAG pipeline uses the GitHub Models API
+  // (gpt-4o-mini + text-embedding-3-small) at no extra cost.
+  "postStartCommand": "python server.py --host 0.0.0.0 --port 8000 &",
+
+  // ---------------------------------------------------------------------------
+  // Environment variables
+  // ---------------------------------------------------------------------------
+  "remoteEnv": {
+    // Forward the Codespace-injected GITHUB_TOKEN to the RAG module so it
+    // can call the GitHub Models API (https://models.inference.ai.azure.com).
+    // server.py also performs this forwarding automatically, but setting it
+    // here ensures it is available for interactive use too.
+    "MSR_GITHUB_TOKEN": "${localEnv:GITHUB_TOKEN}",
+
+    // Optional overrides – set these as Codespace secrets in the GitHub UI
+    // (Settings → Codespaces → Secrets) if you want custom values:
+    //
+    // "MSR_API_KEY":       "${localEnv:MSR_API_KEY}",
+    // "MSR_PLANT_DATA_URL": "${localEnv:MSR_PLANT_DATA_URL}",
+    // "MSR_GITHUB_TOKEN":  "${localEnv:MSR_GITHUB_TOKEN}",   // custom PAT
+
+    // Chat model to use via GitHub Models (can be overridden via Codespace secret)
+    "MSR_OPENAI_MODEL": "gpt-4o-mini",
+
+    // Embedding model to use via GitHub Models
+    "MSR_EMBED_MODEL": "text-embedding-3-small",
+
+    // KB and docs directories inside the container
+    "MSR_KB_DIR": "/workspaces/msr_data_layer/kb_store",
+    "MSR_DOCS_DIR": "/workspaces/msr_data_layer/docs",
+    "MSR_SERVER_HOST": "0.0.0.0",
+    "MSR_SERVER_PORT": "8000"
+  },
+
+  // VS Code extensions useful for working with this project
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.pylint",
+        "GitHub.copilot",
+        "GitHub.copilot-chat"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}

@@ -394,6 +394,116 @@ make remote-gpu-query QUESTION="What is the thermal efficiency of TMSR-LF1?"
 
 ---
 
+## GitHub Codespaces Deployment (GitHub Copilot Pro – no extra subscription required)
+
+If you have a **GitHub Copilot Pro** subscription you can deploy the MSR data
+layer on a publicly accessible HTTPS URL using **GitHub Codespaces** and the
+**GitHub Models API**, with no AWS, Azure, or OpenAI accounts required.
+
+### How it works
+
+| GitHub feature | Role |
+|---|---|
+| **GitHub Codespaces** | Runs the Python HTTP server in a managed cloud VM |
+| **Port forwarding** | Exposes `server.py` on a public `*.preview.app.github.dev` URL |
+| **GitHub Models API** | Provides `gpt-4o-mini` (chat) and `text-embedding-3-small` (embeddings) via `GITHUB_TOKEN` |
+
+The `GITHUB_TOKEN` secret is injected automatically into every Codespace.
+`server.py` forwards it to `MSR_GITHUB_TOKEN`, which the RAG pipeline uses to
+call `https://models.inference.ai.azure.com` – the same OpenAI-compatible
+endpoint used by GitHub Copilot Chat.
+
+### Deploy in 5 steps
+
+**Step 1 – Open a Codespace**
+
+Go to your fork of this repository on GitHub, click **Code → Codespaces →
+Create codespace on main** (or your working branch).  The
+`.devcontainer/devcontainer.json` configuration installs Python dependencies
+and starts `server.py` automatically when the Codespace boots.
+
+**Step 2 – Wait for the server to start**
+
+The terminal will print:
+
+```
+MSR Data Layer HTTP server listening on http://0.0.0.0:8000
+Endpoints: GET /health  POST /mcp  POST /query  POST /kb/update  POST /data/ingest
+```
+
+**Step 3 – Make port 8000 public**
+
+In VS Code (inside the Codespace), open the **Ports** panel, right-click
+**port 8000**, and select **Port Visibility → Public**.  You will get a URL
+like:
+
+```
+https://<codespace-name>-8000.preview.app.github.dev
+```
+
+**Step 4 – Query the data layer**
+
+```bash
+BASE_URL="https://<codespace-name>-8000.preview.app.github.dev"
+
+# Health check
+curl "$BASE_URL/health"
+
+# RAG query (uses GitHub Models gpt-4o-mini for synthesis)
+curl -X POST "$BASE_URL/query" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What are the key operational parameters of the TMSR-LF1 reactor?"}'
+
+# MCP JSON-RPC (for MCP-compatible clients)
+curl -X POST "$BASE_URL/mcp" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_reactor_status","arguments":{}}}'
+```
+
+**Step 5 – (Optional) Protect with an API key**
+
+Add a Codespace secret named `MSR_API_KEY` in
+**GitHub → Settings → Codespaces → Secrets**.  All requests will then require
+an `X-Api-Key: <your-key>` header.
+
+### Manual start / restart
+
+If the server is not running (e.g. after the Codespace was paused), restart it
+from the terminal:
+
+```bash
+python server.py --host 0.0.0.0 --port 8000
+```
+
+### Environment variables
+
+All variables are configured via `.devcontainer/devcontainer.json` or as
+Codespace secrets:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MSR_GITHUB_TOKEN` | auto from `GITHUB_TOKEN` | GitHub PAT for GitHub Models API |
+| `MSR_OPENAI_MODEL` | `gpt-4o-mini` | Chat model (any GitHub Models chat model) |
+| `MSR_EMBED_MODEL` | `text-embedding-3-small` | Embedding model |
+| `MSR_API_KEY` | (unset) | Optional bearer token for endpoint auth |
+| `MSR_PLANT_DATA_URL` | (unset) | URL of external SCADA/historian REST API |
+| `MSR_KB_DIR` | `/workspaces/msr_data_layer/kb_store` | Persistent KB directory |
+| `MSR_SERVER_PORT` | `8000` | HTTP server port |
+
+### GitHub Models rate limits
+
+GitHub Copilot Pro includes access to GitHub Models with the following
+approximate limits (subject to change; see
+[GitHub Models docs](https://docs.github.com/en/github-models/prototyping-with-ai-models)):
+
+- **gpt-4o-mini**: ~150 requests/day, ~15 requests/minute
+- **text-embedding-3-small**: ~150 requests/day, ~15 requests/minute
+
+For higher throughput, set `MSR_OPENAI_API_KEY` to use a paid OpenAI key
+instead (the same `MSR_OPENAI_BASE_URL`/`MSR_OPENAI_MODEL` env vars apply).
+
+---
+
 ## AWS Lambda Deployment (`lambda_function.py` + `template.yaml`)
 
 The MSR knowledge base can be hosted as a **serverless HTTPS service on AWS

@@ -58,7 +58,13 @@ MSR_KB_S3_PREFIX       S3 key prefix (default: ``kb/``)
 MSR_API_KEY            Shared API key for request authentication (optional)
 MSR_PLANT_DATA_URL     URL of external plant data REST API (optional; when
                        unset, the development stub is used for sensor reads)
-MSR_OPENAI_API_KEY     OpenAI key for LLM + embeddings
+MSR_GITHUB_TOKEN       GitHub personal access token – used with the GitHub
+                       Models API (https://models.inference.ai.azure.com) for
+                       LLM and embeddings.  Set automatically to ``GITHUB_TOKEN``
+                       inside GitHub Codespaces (see ``.devcontainer/``).
+                       Takes effect only when ``MSR_OPENAI_API_KEY`` is unset.
+MSR_OPENAI_API_KEY     OpenAI key for LLM + embeddings (takes precedence over
+                       ``MSR_GITHUB_TOKEN`` when both are set)
 MSR_OPENAI_BASE_URL    OpenAI-compatible API base URL
 MSR_OPENAI_MODEL       Chat model (default: gpt-4o-mini)
 MSR_EMBED_MODEL        Embedding model (default: text-embedding-3-small)

@@ -14,6 +14,7 @@ Architecture
 1. Sentence-aware text chunking with configurable overlap.
 2. Dense vector embeddings via:
    - Local GPU models via sentence-transformers (when ``MSR_USE_LOCAL_GPU=true``), or
+   - GitHub Models API (when ``MSR_GITHUB_TOKEN`` is set; free with Copilot Pro), or
    - OpenAI-compatible Embeddings API (when ``MSR_OPENAI_API_KEY`` is set), or
    - Random-projection engine (numpy-based, zero external dependencies).
 3. Source insights – LLM-generated summary, topics, and key facts for each
@@ -35,10 +36,21 @@ Architecture
 
 Environment Variables
 ---------------------
-MSR_OPENAI_API_KEY    API key for LLM + embeddings
-                      (if unset, random-projection embedding and no LLM)
+MSR_GITHUB_TOKEN      GitHub personal access token (PAT) used to call the
+                      GitHub Models API (https://models.inference.ai.azure.com).
+                      Available as ``GITHUB_TOKEN`` inside GitHub Codespaces.
+                      When set (and ``MSR_OPENAI_API_KEY`` is unset) the
+                      service automatically uses GitHub Models for both
+                      embeddings (text-embedding-3-small) and chat
+                      (gpt-4o-mini) – no separate OpenAI subscription needed.
+MSR_OPENAI_API_KEY    API key for an OpenAI-compatible LLM/embeddings service.
+                      Takes precedence over ``MSR_GITHUB_TOKEN`` when both are
+                      set.  If neither key is provided, the pipeline falls back
+                      to random-projection embeddings and skips LLM synthesis.
 MSR_OPENAI_BASE_URL   OpenAI-compatible API base URL
-                      (default: https://api.openai.com/v1)
+                      (default: https://api.openai.com/v1; automatically set
+                      to https://models.inference.ai.azure.com when using
+                      ``MSR_GITHUB_TOKEN``)
 MSR_OPENAI_MODEL      Chat model (default: gpt-4o-mini)
 MSR_EMBED_MODEL       Embedding model (default: text-embedding-3-small)
 MSR_DOCS_DIR          Reference documents directory (default: ./docs)
@@ -988,11 +1000,40 @@ class MSRDigitalTwinRAG:
        (CUDA/MPS when available, CPU fallback).
     """
 
+    # GitHub Models API endpoint (used with MSR_GITHUB_TOKEN)
+    _GITHUB_MODELS_BASE_URL: str = "https://models.inference.ai.azure.com"
+
     def __init__(self, docs_dir: str | Path | None = None) -> None:
-        self._api_key = os.environ.get("MSR_OPENAI_API_KEY", "")
-        self._base_url = os.environ.get(
-            "MSR_OPENAI_BASE_URL", "https://api.openai.com/v1"
+        _openai_key = os.environ.get("MSR_OPENAI_API_KEY", "")
+        # Accept MSR_GITHUB_TOKEN explicitly, or fall back to the GITHUB_TOKEN
+        # injected automatically by GitHub Codespaces / Actions.
+        _github_token = (
+            os.environ.get("MSR_GITHUB_TOKEN", "")
+            or os.environ.get("GITHUB_TOKEN", "")
         )
+
+        # GitHub Models: when GITHUB_TOKEN is set and no explicit OpenAI key,
+        # use https://models.inference.ai.azure.com with the GitHub PAT.
+        if _openai_key:
+            self._api_key = _openai_key
+            self._base_url = os.environ.get(
+                "MSR_OPENAI_BASE_URL", "https://api.openai.com/v1"
+            )
+        elif _github_token:
+            self._api_key = _github_token
+            self._base_url = os.environ.get(
+                "MSR_OPENAI_BASE_URL", self._GITHUB_MODELS_BASE_URL
+            )
+            print(
+                "[RAG] Using GitHub Models API "
+                f"(base_url={self._base_url})."
+            )
+        else:
+            self._api_key = ""
+            self._base_url = os.environ.get(
+                "MSR_OPENAI_BASE_URL", "https://api.openai.com/v1"
+            )
+
         self._model = os.environ.get("MSR_OPENAI_MODEL", "gpt-4o-mini")
         self._embed_model = os.environ.get(
             "MSR_EMBED_MODEL", "text-embedding-3-small"
@@ -1056,8 +1097,9 @@ class MSRDigitalTwinRAG:
 
         Priority:
         1. Local GPU LLM (when ``MSR_USE_LOCAL_GPU=true``)
-        2. OpenAI-compatible API (when ``MSR_OPENAI_API_KEY`` is set)
-        3. Raises ``RuntimeError`` if neither is available.
+        2. GitHub Models API (when ``MSR_GITHUB_TOKEN`` is set)
+        3. OpenAI-compatible API (when ``MSR_OPENAI_API_KEY`` is set)
+        4. Raises ``RuntimeError`` if neither is available.
         """
         if self._local_llm is not None:
             return self._local_llm.generate(messages, max_new_tokens=max_tokens)
@@ -1065,7 +1107,8 @@ class MSRDigitalTwinRAG:
             return _call_llm(messages, self._api_key, self._base_url, self._model, max_tokens)
         raise RuntimeError(
             "No LLM backend configured. "
-            "Set MSR_OPENAI_API_KEY for the OpenAI API, or "
+            "Set MSR_GITHUB_TOKEN (GitHub Copilot Pro / GitHub Models), "
+            "MSR_OPENAI_API_KEY for the OpenAI API, or "
             "MSR_USE_LOCAL_GPU=true for local GPU inference."
         )
 
@@ -1138,9 +1181,9 @@ class MSRDigitalTwinRAG:
         """
         Answer *question* using the multi-step RAG pipeline.
 
-        If no LLM is configured (neither ``MSR_OPENAI_API_KEY`` nor
-        ``MSR_USE_LOCAL_GPU=true``), returns a structured context summary
-        that the caller can pass to their own LLM.
+        If no LLM is configured (neither ``MSR_GITHUB_TOKEN``,
+        ``MSR_OPENAI_API_KEY``, nor ``MSR_USE_LOCAL_GPU=true``), returns a
+        structured context summary that the caller can pass to their own LLM.
         """
         reactor_context = self._fetch_reactor_context()
 
@@ -1150,7 +1193,8 @@ class MSRDigitalTwinRAG:
                 question, self._format_chunks(chunks), reactor_context
             )
             return (
-                "[No LLM configured – set MSR_OPENAI_API_KEY or "
+                "[No LLM configured – set MSR_GITHUB_TOKEN (GitHub Models), "
+                "MSR_OPENAI_API_KEY, or "
                 "MSR_USE_LOCAL_GPU=true to enable generation]\n\n"
                 + prompt
             )

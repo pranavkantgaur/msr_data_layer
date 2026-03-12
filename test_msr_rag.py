@@ -318,13 +318,15 @@ def test_kb_hybrid_scores_in_0_1(tmp_kb):
 def rag_no_llm(tmp_path, monkeypatch):
     """RAG instance with no API key and a temporary KB + docs dir."""
     monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("MSR_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
     return MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
 
 
 def test_rag_no_llm_answer_contains_reactor_state(rag_no_llm):
     answer = rag_no_llm.answer("What is the current reactor status?")
-    assert "MSR_OPENAI_API_KEY" in answer
+    assert "MSR_GITHUB_TOKEN" in answer or "MSR_OPENAI_API_KEY" in answer
     assert "reactor" in answer.lower() or "status" in answer.lower()
 
 
@@ -349,6 +351,8 @@ def test_rag_answer_includes_document_after_add(rag_no_llm):
 def test_rag_load_directory(tmp_path, monkeypatch):
     """RAG loads .md and .txt files from docs_dir on init."""
     monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("MSR_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
     docs = tmp_path / "docs"
     docs.mkdir()
@@ -368,6 +372,8 @@ def test_rag_load_directory(tmp_path, monkeypatch):
 def test_rag_no_duplicate_loading(tmp_path, monkeypatch):
     """Calling RAG twice with the same docs_dir does not double-index."""
     monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("MSR_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     kb_dir = str(tmp_path / "kb")
     monkeypatch.setenv("MSR_KB_DIR", kb_dir)
     docs = tmp_path / "docs"
@@ -606,6 +612,8 @@ class TestMSRDigitalTwinRAGGPU:
         monkeypatch.setenv("MSR_USE_LOCAL_GPU", "true")
         monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
         monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("MSR_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 
         mock_st_instance = self._mock_engine()
         mock_st_cls = MagicMock(return_value=mock_st_instance)
@@ -634,6 +642,8 @@ class TestMSRDigitalTwinRAGGPU:
         monkeypatch.setenv("MSR_USE_LOCAL_GPU", "false")
         monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
         monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("MSR_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
         rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
         assert isinstance(rag._embed_engine, RandomProjectionEmbeddingEngine)
         assert rag._local_llm is None
@@ -641,6 +651,8 @@ class TestMSRDigitalTwinRAGGPU:
 
     def test_has_llm_false_without_backends(self, tmp_path, monkeypatch):
         monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("MSR_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
         monkeypatch.setenv("MSR_USE_LOCAL_GPU", "false")
         monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
         rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
@@ -649,15 +661,19 @@ class TestMSRDigitalTwinRAGGPU:
     def test_answer_no_llm_mentions_local_gpu(self, tmp_path, monkeypatch):
         """answer() message now mentions MSR_USE_LOCAL_GPU."""
         monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("MSR_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
         monkeypatch.setenv("MSR_USE_LOCAL_GPU", "false")
         monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
         rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
         answer = rag.answer("What is the status?")
-        assert "MSR_USE_LOCAL_GPU" in answer or "MSR_OPENAI_API_KEY" in answer
+        assert "MSR_USE_LOCAL_GPU" in answer or "MSR_GITHUB_TOKEN" in answer or "MSR_OPENAI_API_KEY" in answer
 
     def test_llm_generate_local_path(self, tmp_path, monkeypatch):
         """_llm_generate routes to the local LLM when configured."""
         monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("MSR_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
         monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
         rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
 
@@ -672,6 +688,8 @@ class TestMSRDigitalTwinRAGGPU:
     def test_llm_generate_raises_without_backends(self, tmp_path, monkeypatch):
         """_llm_generate raises RuntimeError when neither OpenAI nor local GPU is set."""
         monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("MSR_GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
         monkeypatch.setenv("MSR_KB_DIR", str(tmp_path / "kb"))
         rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
         rag._local_llm = None
