@@ -24,6 +24,7 @@ data-layer capability, providing:
 | [mccoy_1970_tellurium_embrittlement.md](mccoy_1970_tellurium_embrittlement.md) | McCoy et al., *Nucl. Appl. Technol.* | Tellurium-induced intergranular cracking of Hastelloy N | 1970 |
 | [baes_1974_redox_chemistry.md](baes_1974_redox_chemistry.md) | Baes, *J. Nucl. Mater.* | Redox chemistry and UF₃/UF₄ control in FLiBe fuel salt | 1974 |
 | [bettis_robertson_1970_thorium_breeding_fuel_cycle.md](bettis_robertson_1970_thorium_breeding_fuel_cycle.md) | Bettis & Robertson, *Nucl. Appl. & Tech.* | Thorium breeding cycle, Pa-233 management, and online fuel processing for Copenhagen Atomics' WATT reactor | 1970 |
+| [nrc_2017_msr_regulatory_challenges.md](nrc_2017_msr_regulatory_challenges.md) | NRC Staff, ADAMS ML17331B126 | Regulatory challenges for MSR licensing — LBEs, source term, materials qualification, QA records, safeguards | 2017 |
 
 ---
 
