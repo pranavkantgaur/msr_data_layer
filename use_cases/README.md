@@ -31,6 +31,30 @@ data-layer capability, providing:
 
 ---
 
+## Physical AI Foundation-Model Training Use Cases
+
+The [`physical_ai/`](physical_ai/) subfolder contains use cases showing how
+the data layer supplies training data for foundation models powering the
+12 robotic operational areas of the
+[MSR Physical AI Layer](https://github.com/pranavkantgaur/msr_physical_ai_layer):
+
+| Rank | File | Robot | Area |
+|------|------|-------|------|
+| 1 | [physical_ai/01_primary_loop_maintenance_repair.md](physical_ai/01_primary_loop_maintenance_repair.md) | PLMR-01 | Primary loop maintenance & repair |
+| 2 | [physical_ai/02_hot_cell_chemical_processing.md](physical_ai/02_hot_cell_chemical_processing.md) | HCPR-01 | Hot-cell chemical processing automation |
+| 3 | [physical_ai/03_salt_sampling_analysis.md](physical_ai/03_salt_sampling_analysis.md) | SSR-01 | Salt sampling & analysis |
+| 4 | [physical_ai/04_radiation_mapping_inspection.md](physical_ai/04_radiation_mapping_inspection.md) | RMR-01 | Radiation mapping & autonomous inspection |
+| 5 | [physical_ai/05_freeze_plug_safety_monitoring.md](physical_ai/05_freeze_plug_safety_monitoring.md) | FPMR-01 | Freeze plug safety monitoring |
+| 6 | [physical_ai/06_fuel_salt_transport_refilling.md](physical_ai/06_fuel_salt_transport_refilling.md) | FSTR-01 | Fuel salt transport & refilling |
+| 7 | [physical_ai/07_graphite_moderator_inspection.md](physical_ai/07_graphite_moderator_inspection.md) | GIR-01 | Graphite moderator inspection & replacement |
+| 8 | [physical_ai/08_tritium_management.md](physical_ai/08_tritium_management.md) | TMR-01 | Tritium management systems |
+| 9 | [physical_ai/09_off_gas_system_handling.md](physical_ai/09_off_gas_system_handling.md) | OGSR-01 | Off-gas system handling |
+| 10 | [physical_ai/10_waste_salt_handling_solidification.md](physical_ai/10_waste_salt_handling_solidification.md) | WSHR-01 | Waste salt handling & solidification |
+| 11 | [physical_ai/11_external_structural_inspection.md](physical_ai/11_external_structural_inspection.md) | SIR-01 | External structural inspection |
+| 12 | [physical_ai/12_security_safeguards_monitoring.md](physical_ai/12_security_safeguards_monitoring.md) | SPR-01 | Security & safeguards monitoring |
+
+---
+
 ## Common Data-Layer APIs Used in All Case Studies
 
 | Operation | API |
