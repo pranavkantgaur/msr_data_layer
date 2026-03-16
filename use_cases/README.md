@@ -25,6 +25,9 @@ data-layer capability, providing:
 | [baes_1974_redox_chemistry.md](baes_1974_redox_chemistry.md) | Baes, *J. Nucl. Mater.* | Redox chemistry and UF₃/UF₄ control in FLiBe fuel salt | 1974 |
 | [bettis_robertson_1970_thorium_breeding_fuel_cycle.md](bettis_robertson_1970_thorium_breeding_fuel_cycle.md) | Bettis & Robertson, *Nucl. Appl. & Tech.* | Thorium breeding cycle, Pa-233 management, and online fuel processing for Copenhagen Atomics' WATT reactor | 1970 |
 | [nrc_2017_msr_regulatory_challenges.md](nrc_2017_msr_regulatory_challenges.md) | NRC Staff, ADAMS ML17331B126 | Regulatory challenges for MSR licensing — LBEs, source term, materials qualification, QA records, safeguards | 2017 |
+| [xue_2026_prhrs_transient_evaluation.md](xue_2026_prhrs_transient_evaluation.md) | Xue S. et al., *Ann. Nucl. Energy* | Transient performance evaluation of passive residual heat removal system in liquid molten salt reactor (RELAP5-TMSR) | 2026 |
+| [yang_2025_msp_pump_thermal_optimisation.md](yang_2025_msp_pump_thermal_optimisation.md) | Yang J. et al., SINAP/CAS | Thermal resistance optimisation of high-temperature molten salt pump via RSM and NSGA-II (10.3 °C bearing temperature reduction) | 2025 |
+| [wang_2026_resta3d_tmsr_transient_safety.md](wang_2026_resta3d_tmsr_transient_safety.md) | Wang K. et al., SINAP/CAS, *Ann. Nucl. Energy* | RESTA-3D reactor dynamics code with DNP transport and N-TH coupling — validation against MSRE and 2 MWth TMSR transient safety analysis | 2026 |
 
 ---
 
