@@ -76,29 +76,12 @@ The RAG pipeline auto-selects the best available engine at startup:
 
 ---
 
-## Literature discovery sources
-
-The KB update pipeline spans four sources (inspired by
-[AutoResearchClaw](https://github.com/aiming-lab/AutoResearchClaw)'s
-Phase B Literature Discovery):
-
-| Source | Loader | CLI flag | Env vars |
-|---|---|---|---|
-| ORNL MSR Archive | `MSRArchiveLoader` | `--update-archive` | `MSR_ARCHIVE_REPO`, `MSR_ARCHIVE_BRANCH` |
-| OpenAlex API | `OpenAlexLoader` | `--update-openalex` | `MSR_OPENALEX_MAX_RESULTS`, `MSR_OPENALEX_EMAIL` |
-| arXiv Atom XML | `ArXivLoader` | `--update-arxiv` | `MSR_ARXIV_MAX_RESULTS` |
-| Semantic Scholar | `SemanticScholarLoader` | `--update-semanticscholar` | `MSR_S2_API_KEY`, `MSR_S2_MAX_RESULTS` |
-
----
-
 ## External data sources
 
 | Source | Protocol | Authentication |
 |---|---|---|
 | ORNL MSR Archive | HTTPS fetch (public) | None |
 | OpenAlex API | REST/HTTPS | None (public, rate-limited) |
-| arXiv Atom XML API | HTTPS (Atom/XML) | None (public; ≥3s between requests per ToS) |
-| Semantic Scholar Graph API | REST/HTTPS | Optional `MSR_S2_API_KEY` (higher rate limits) |
 | Plant SCADA/historian | REST/HTTPS (`MSR_PLANT_DATA_URL`) | Bearer token or mTLS (operator-configured) |
 | GitHub Models API | REST/HTTPS | `MSR_GITHUB_TOKEN` |
 | OpenAI-compatible API | REST/HTTPS | `MSR_OPENAI_API_KEY` |
