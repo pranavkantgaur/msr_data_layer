@@ -1,0 +1,41 @@
+# Cursor agent ignore file
+# Exclude large generated/binary artefacts that agents don't need to read
+
+# AWS SAM build cache and deployment packages
+.aws-sam/
+samconfig.toml
+
+# Knowledge base store (large binary embeddings)
+kb_store/
+
+# Reference documents downloaded at runtime
+docs/
+
+# Python build artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# Jupyter checkpoint files
+.ipynb_checkpoints/
+nb_output/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+.env
+*.env
+samconfig.toml

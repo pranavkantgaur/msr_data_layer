@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "msr-data-layer": {
+      "description": "MSR knowledge base and live plant data — read + ingest tools for Molten Salt Reactor operations",
+      "command": "python",
+      "args": ["msr_mcp_server_main.py"],
+      "env": {
+        "MSR_GITHUB_TOKEN": "${MSR_GITHUB_TOKEN}",
+        "MSR_PLANT_DATA_URL": "${MSR_PLANT_DATA_URL}",
+        "MSR_KB_DIR": "${MSR_KB_DIR}",
+        "MSR_DOCS_DIR": "${MSR_DOCS_DIR}"
+      },
+      "tools": [
+        "get_reactor_status",
+        "get_sensor_reading",
+        "get_all_sensor_readings",
+        "get_sensor_history",
+        "get_active_alarms",
+        "get_data_source_info",
+        "ingest_plant_data"
+      ]
+    }
+  }
+}

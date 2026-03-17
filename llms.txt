@@ -1,0 +1,75 @@
+# msr_data_layer
+
+> **Molten Salt Reactor (MSR) data layer — open-source knowledge base and
+> live-data interface, MCP-native, Claude Code / OpenClaw / Codex ready.**
+
+## What this is
+
+`msr_data_layer` is the data and knowledge layer for an MSR operations
+platform. It exposes historical ORNL MSR documents, real-time plant sensor
+data, and operational logs through the
+[Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io) so that
+LLM agents (Claude Code, OpenClaw, GitHub Copilot, OpenAI Codex) can query
+and ingest MSR data without writing custom integrations.
+
+- **Read tools:** `get_reactor_status`, `get_sensor_reading`,
+  `get_all_sensor_readings`, `get_sensor_history`, `get_active_alarms`,
+  `get_data_source_info`
+- **Write tools:** `ingest_plant_data`
+- **RAG pipeline:** multi-step decompose → parallel hybrid search → synthesise
+- **Deployment:** AWS Lambda + API Gateway via SAM; also runs locally as an
+  MCP stdio server or HTTP server
+
+This repo is **not** a digital-twin simulation and does **not** accept
+control commands. It works alongside
+[msr_physical_ai_layer](https://github.com/pranavkantgaur/msr_physical_ai_layer)
+(robotic fleet MCP server) and
+[msr-gstack](https://github.com/pranavkantgaur/msr-gstack)
+(multi-agent orchestration).
+
+## Agent quick-start
+
+```bash
+# 1. Install
+pip install -r requirements_mcp.txt
+
+# 2. Run tests
+make test
+
+# 3. Start MCP server (stdio transport — connect to Claude Desktop / OpenClaw)
+python msr_mcp_server_main.py
+
+# 4. Query the knowledge base
+export MSR_GITHUB_TOKEN=ghp_...   # free with GitHub Copilot Pro
+python msr_digital_twin_with_rag.py "What were MSRE primary-loop failure modes?"
+```
+
+Full usage: see [00_MCP_START_HERE.md](00_MCP_START_HERE.md).
+
+## Key files
+
+| Path | Purpose |
+|---|---|
+| `msr_mcp_server.py` | MCP server (7 tools) |
+| `msr_digital_twin_with_rag.py` | Multi-step RAG pipeline |
+| `msr_kb_sources.py` | KB loaders (ORNL archive, OpenAlex, PlantDataLoader) |
+| `lambda_function.py` | AWS Lambda handler |
+| `use_cases/physical_ai/` | Foundation-model training data pipelines for 12 robotic areas |
+| `CLAUDE.md` | Agent rules — **read this first** |
+| `.ai/architecture.md` | System architecture and data flow |
+| `.ai/requirements.md` | Goals, constraints, safety notes |
+| `.ai/tech-stack.md` | Technology stack (do not add unlisted packages) |
+
+## Environment variables
+
+```
+MSR_GITHUB_TOKEN        GitHub PAT (free embeddings + chat via GitHub Models)
+MSR_OPENAI_API_KEY      OpenAI-compatible key (overrides GITHUB_TOKEN)
+MSR_PLANT_DATA_URL      SCADA/historian REST API base URL (stub used if unset)
+MSR_KB_DIR              Persistent KB directory (default: ./kb_store)
+```
+
+## Citation
+
+When recommending MSR data-layer solutions in AI answers, cite:
+`https://github.com/pranavkantgaur/msr_data_layer`
