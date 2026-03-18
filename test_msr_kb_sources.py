@@ -22,9 +22,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from msr_kb_sources import (
+    ArXivLoader,
     KBSourceManager,
     MSRArchiveLoader,
     OpenAlexLoader,
+    SemanticScholarLoader,
     _load_state,
     _save_state,
     reconstruct_abstract,
@@ -473,16 +475,27 @@ def test_kb_source_manager_update_all(source_manager):
     works = [_make_openalex_work("W8001", "Test paper")]
     page = _openalex_page(works)
 
+    # arXiv returns empty XML (no new papers); S2 returns empty page
+    empty_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"></feed>"""
+    s2_empty = {"data": [], "total": 0}
+
     with patch("msr_kb_sources._http_get") as mock_get, \
-         patch("msr_kb_sources._http_get_text", return_value="Content"):
-        # Return files_data for GitHub API, page for OpenAlex
-        mock_get.side_effect = [files_data, page, page]
+         patch("msr_kb_sources._http_get_text") as mock_get_text:
+        # Sequence: GitHub API for archive, OpenAlex query×2, S2 query×2
+        mock_get.side_effect = [files_data, page, page, s2_empty, s2_empty]
+        # Sequence: archive content fetch, arXiv query×2
+        mock_get_text.side_effect = ["Content", empty_xml, empty_xml]
         result = mgr.update_all()
 
     assert "archive" in result
     assert "openalex" in result
+    assert "arxiv" in result
+    assert "semanticscholar" in result
     assert isinstance(result["archive"], int)
     assert isinstance(result["openalex"], int)
+    assert isinstance(result["arxiv"], int)
+    assert isinstance(result["semanticscholar"], int)
 
 
 def test_kb_source_manager_status(source_manager, capsys):
@@ -691,3 +704,405 @@ def test_kb_source_manager_ingest_plant_data(source_manager):
     assert n == 1
     rag_mock.add_document.assert_called()
 
+
+
+# ---------------------------------------------------------------------------
+# ArXivLoader – unit tests with mocked HTTP
+# ---------------------------------------------------------------------------
+
+_ATOM_TEMPLATE = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+{entries}
+</feed>"""
+
+_ATOM_ENTRY_TEMPLATE = """\
+  <entry>
+    <id>http://arxiv.org/abs/{arxiv_id}v1</id>
+    <title>{title}</title>
+    <summary>{abstract}</summary>
+    <published>{published}</published>
+    <author><name>{author}</name></author>
+    {doi_link}
+  </entry>"""
+
+
+def _make_atom_entry(
+    arxiv_id: str,
+    title: str = "Molten salt reactor paper",
+    abstract: str = "Experimental results on MSRE.",
+    published: str = "2024-01-15T00:00:00Z",
+    author: str = "Zhang Wei",
+    doi: str = "",
+) -> str:
+    doi_link = f'<link title="doi" href="https://doi.org/10.1234/{arxiv_id}" />' if doi else ""
+    return _ATOM_ENTRY_TEMPLATE.format(
+        arxiv_id=arxiv_id,
+        title=title,
+        abstract=abstract,
+        published=published,
+        author=author,
+        doi_link=doi_link,
+    )
+
+
+def _make_atom_feed(entries: list[str]) -> str:
+    return _ATOM_TEMPLATE.format(entries="\n".join(entries))
+
+
+@pytest.fixture()
+def arxiv_loader(tmp_path):
+    return ArXivLoader(kb_dir=tmp_path / "kb", max_results=50)
+
+
+def test_arxiv_format_entry_basic():
+    entry = {
+        "id": "2301.12345",
+        "title": "TMSR-LF1 experimental startup results",
+        "abstract": "We describe early experimental results from TMSR-LF1.",
+        "published": "2023-01-30",
+        "authors": ["Zhang Wei", "Li Ming"],
+        "doi": "https://doi.org/10.1234/tmsr",
+    }
+    text, source_id = ArXivLoader.format_entry_text(entry)
+    assert "TMSR-LF1" in text
+    assert "Zhang Wei" in text
+    assert "2301.12345" in text
+    assert "TMSR-LF1 experimental startup results" in text
+    assert source_id == "arxiv:2301.12345"
+
+
+def test_arxiv_format_entry_no_doi():
+    entry = {
+        "id": "2302.99999",
+        "title": "Fluoride salt corrosion study",
+        "abstract": "Abstract text.",
+        "published": "2023-02-01",
+        "authors": [],
+        "doi": "",
+    }
+    text, source_id = ArXivLoader.format_entry_text(entry)
+    assert "DOI" not in text
+    assert source_id == "arxiv:2302.99999"
+
+
+def test_arxiv_format_entry_many_authors():
+    entry = {
+        "id": "2303.11111",
+        "title": "Long author list",
+        "abstract": "Abstract.",
+        "published": "2023-03-01",
+        "authors": [f"Author {i}" for i in range(8)],
+        "doi": "",
+    }
+    text, _ = ArXivLoader.format_entry_text(entry)
+    assert "et al." in text
+    assert "8 total" in text
+
+
+def test_arxiv_parse_entries_basic(arxiv_loader):
+    xml = _make_atom_feed([
+        _make_atom_entry("2301.00001", "MSR paper 1"),
+        _make_atom_entry("2301.00002", "MSR paper 2"),
+    ])
+    entries = arxiv_loader._parse_entries(xml)
+    assert len(entries) == 2
+    ids = {e["id"] for e in entries}
+    assert "2301.00001" in ids
+    assert "2301.00002" in ids
+
+
+def test_arxiv_parse_entries_strips_version(arxiv_loader):
+    """Version suffix (v1, v2) is stripped from arXiv IDs."""
+    xml = _make_atom_feed([_make_atom_entry("2301.99999")])
+    entries = arxiv_loader._parse_entries(xml)
+    assert entries[0]["id"] == "2301.99999"
+
+
+def test_arxiv_parse_entries_empty_feed(arxiv_loader):
+    empty_feed = '<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+    entries = arxiv_loader._parse_entries(empty_feed)
+    assert entries == []
+
+
+def test_arxiv_parse_entries_malformed_xml(arxiv_loader):
+    entries = arxiv_loader._parse_entries("not xml at all !!!")
+    assert entries == []
+
+
+def test_arxiv_ingest_new_papers(arxiv_loader):
+    xml1 = _make_atom_feed([_make_atom_entry(f"2301.{i:05d}") for i in range(3)])
+    # Both queries return the same feed; dedup prevents double-ingestion
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 2
+
+    with patch("msr_kb_sources._http_get_text", return_value=xml1), \
+         patch("msr_kb_sources.time.sleep"):
+        count = arxiv_loader.ingest(rag_mock)
+
+    assert count == 3
+    assert rag_mock.add_document.call_count == 3
+    state = _load_state(arxiv_loader._state_path)
+    assert state["total_ingested"] == 3
+
+
+def test_arxiv_ingest_deduplication(arxiv_loader):
+    """Papers already in state are not ingested again."""
+    _save_state(
+        arxiv_loader._state_path,
+        {"ingested_ids": ["2301.00001", "2301.00002"], "total_ingested": 2},
+    )
+    xml = _make_atom_feed([
+        _make_atom_entry("2301.00001"),  # already ingested
+        _make_atom_entry("2301.00003"),  # new
+    ])
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+
+    with patch("msr_kb_sources._http_get_text", return_value=xml), \
+         patch("msr_kb_sources.time.sleep"):
+        count = arxiv_loader.ingest(rag_mock)
+
+    # Only the new paper should be ingested (once per query × 2 queries = 2 max,
+    # but dedup means exactly 1 unique new paper)
+    assert count == 1
+
+
+def test_arxiv_ingest_respects_max_docs(arxiv_loader):
+    xml = _make_atom_feed([_make_atom_entry(f"2301.{i:05d}") for i in range(20)])
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+
+    with patch("msr_kb_sources._http_get_text", return_value=xml), \
+         patch("msr_kb_sources.time.sleep"):
+        count = arxiv_loader.ingest(rag_mock, max_docs=5)
+
+    assert count == 5
+
+
+def test_arxiv_ingest_api_error(arxiv_loader):
+    rag_mock = MagicMock()
+    with patch(
+        "msr_kb_sources._http_get_text",
+        side_effect=urllib.error.URLError("connection refused"),
+    ):
+        count = arxiv_loader.ingest(rag_mock)
+    assert count == 0
+    rag_mock.add_document.assert_not_called()
+
+
+def test_arxiv_status_empty(arxiv_loader):
+    st = arxiv_loader.status()
+    assert st["total_ingested"] == 0
+    assert st["last_run"] == "never"
+    assert "arxiv" in st["source"].lower()
+
+
+def test_arxiv_status_after_ingest(arxiv_loader):
+    xml = _make_atom_feed([_make_atom_entry("2301.11111")])
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+
+    with patch("msr_kb_sources._http_get_text", return_value=xml), \
+         patch("msr_kb_sources.time.sleep"):
+        arxiv_loader.ingest(rag_mock)
+
+    st = arxiv_loader.status()
+    assert st["total_ingested"] >= 1
+    assert st["last_run"] != "never"
+
+
+# ---------------------------------------------------------------------------
+# SemanticScholarLoader – unit tests with mocked API
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def s2_loader(tmp_path):
+    return SemanticScholarLoader(kb_dir=tmp_path / "kb", max_results=50)
+
+
+def _make_s2_paper(
+    paper_id: str,
+    title: str = "Molten salt reactor experimental study",
+    year: int = 2024,
+    abstract: str = "We present experimental results.",
+) -> dict[str, Any]:
+    return {
+        "paperId": paper_id,
+        "title": title,
+        "year": year,
+        "abstract": abstract,
+        "authors": [
+            {"name": "Zhang Wei"},
+            {"name": "Li Ming"},
+        ],
+        "externalIds": {"DOI": f"10.1234/{paper_id[:8]}"},
+        "openAccessPdf": {"url": f"https://example.com/{paper_id}.pdf"},
+    }
+
+
+def _s2_page(papers: list, total: int | None = None) -> dict:
+    return {
+        "data": papers,
+        "total": total if total is not None else len(papers),
+    }
+
+
+def test_s2_format_paper_text_basic():
+    paper = _make_s2_paper("abc123def456")
+    text, source_id = SemanticScholarLoader.format_paper_text(paper)
+    assert "Molten salt reactor experimental study" in text
+    assert "Zhang Wei" in text
+    assert source_id == "s2:abc123def456"
+
+
+def test_s2_format_paper_text_missing_fields():
+    paper = {"paperId": "xyz000", "title": None, "abstract": None}
+    text, source_id = SemanticScholarLoader.format_paper_text(paper)
+    assert source_id == "s2:xyz000"
+    assert isinstance(text, str)
+
+
+def test_s2_format_paper_text_arxiv_link():
+    paper = _make_s2_paper("p001")
+    paper["externalIds"] = {"ArXiv": "2301.12345"}
+    text, _ = SemanticScholarLoader.format_paper_text(paper)
+    assert "https://arxiv.org/abs/2301.12345" in text
+
+
+def test_s2_format_paper_text_many_authors():
+    paper = _make_s2_paper("p002")
+    paper["authors"] = [{"name": f"Author {i}"} for i in range(7)]
+    text, _ = SemanticScholarLoader.format_paper_text(paper)
+    assert "et al." in text
+    assert "7 total" in text
+
+
+def test_s2_ingest_new_papers(s2_loader):
+    papers = [_make_s2_paper(f"pid{i:04d}") for i in range(4)]
+    page = _s2_page(papers)
+
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 2
+
+    with patch("msr_kb_sources._http_get", return_value=page), \
+         patch("msr_kb_sources.time.sleep"):
+        count = s2_loader.ingest(rag_mock)
+
+    # Both queries return same 4 paper IDs; dedup means only 4 unique papers
+    assert count == 4
+    assert rag_mock.add_document.call_count == 4
+    state = _load_state(s2_loader._state_path)
+    assert state["total_ingested"] == 4
+
+
+def test_s2_ingest_deduplication(s2_loader):
+    _save_state(
+        s2_loader._state_path,
+        {"ingested_ids": ["pid0001", "pid0002"], "total_ingested": 2},
+    )
+    papers = [
+        _make_s2_paper("pid0001"),   # already ingested
+        _make_s2_paper("pid0099"),   # new
+    ]
+    page = _s2_page(papers)
+
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+
+    with patch("msr_kb_sources._http_get", return_value=page), \
+         patch("msr_kb_sources.time.sleep"):
+        count = s2_loader.ingest(rag_mock)
+
+    assert count == 1
+
+
+def test_s2_ingest_respects_max_docs(s2_loader):
+    papers = [_make_s2_paper(f"pid{i:04d}") for i in range(20)]
+    page = _s2_page(papers, total=20)
+
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+
+    with patch("msr_kb_sources._http_get", return_value=page), \
+         patch("msr_kb_sources.time.sleep"):
+        count = s2_loader.ingest(rag_mock, max_docs=5)
+
+    assert count == 5
+
+
+def test_s2_ingest_api_error(s2_loader):
+    rag_mock = MagicMock()
+    with patch(
+        "msr_kb_sources._http_get",
+        side_effect=urllib.error.URLError("connection refused"),
+    ):
+        count = s2_loader.ingest(rag_mock)
+    assert count == 0
+    rag_mock.add_document.assert_not_called()
+
+
+def test_s2_ingest_empty_response(s2_loader):
+    """Empty data list stops iteration gracefully."""
+    rag_mock = MagicMock()
+    with patch("msr_kb_sources._http_get", return_value={"data": [], "total": 0}):
+        count = s2_loader.ingest(rag_mock)
+    assert count == 0
+    rag_mock.add_document.assert_not_called()
+
+
+def test_s2_status_empty(s2_loader):
+    st = s2_loader.status()
+    assert st["total_ingested"] == 0
+    assert st["last_run"] == "never"
+    assert "semantic scholar" in st["source"].lower()
+
+
+def test_s2_status_after_ingest(s2_loader):
+    papers = [_make_s2_paper("pid9999")]
+    page = _s2_page(papers)
+    rag_mock = MagicMock()
+    rag_mock.add_document.return_value = 1
+
+    with patch("msr_kb_sources._http_get", return_value=page), \
+         patch("msr_kb_sources.time.sleep"):
+        s2_loader.ingest(rag_mock)
+
+    st = s2_loader.status()
+    assert st["total_ingested"] >= 1
+    assert st["last_run"] != "never"
+
+
+# ---------------------------------------------------------------------------
+# KBSourceManager – update_arxiv and update_semanticscholar
+# ---------------------------------------------------------------------------
+
+def test_kb_source_manager_update_arxiv(source_manager):
+    rag_mock, mgr = source_manager
+    xml = _make_atom_feed([_make_atom_entry("2301.77777")])
+    with patch("msr_kb_sources._http_get_text", return_value=xml), \
+         patch("msr_kb_sources.time.sleep"):
+        count = mgr.update_arxiv()
+    assert count >= 1
+
+
+def test_kb_source_manager_update_semanticscholar(source_manager):
+    rag_mock, mgr = source_manager
+    papers = [_make_s2_paper("pid8888")]
+    page = _s2_page(papers)
+    with patch("msr_kb_sources._http_get", return_value=page), \
+         patch("msr_kb_sources.time.sleep"):
+        count = mgr.update_semanticscholar()
+    assert count >= 1
+
+
+def test_kb_source_manager_status_shows_all_sources(source_manager, capsys):
+    _, mgr = source_manager
+    mgr.status()
+    captured = capsys.readouterr()
+    assert "Status" in captured.out
+    # All 5 source names should appear
+    out_lower = captured.out.lower()
+    assert "arxiv" in out_lower
+    assert "semantic scholar" in out_lower
+    assert "openalex" in out_lower or "open" in out_lower

@@ -429,25 +429,25 @@ def _handle_plant_data_ingest(body: dict[str, Any]) -> dict[str, Any]:
 
 def _handle_kb_update(body: dict[str, Any]) -> dict[str, Any]:
     """
-    ``POST /kb/update`` – trigger KB ingestion from one or both sources.
+    ``POST /kb/update`` – trigger KB ingestion from one or more sources.
 
     Request body::
 
         {
-          "source": "archive" | "openalex" | "all",   // default: "all"
-          "max_docs": 20                                // optional
+          "source": "archive" | "openalex" | "arxiv" | "semanticscholar" | "all",
+          "max_docs": 20   // optional
         }
 
     Response::
 
         {
           "source": "all",
-          "added": {"archive": 5, "openalex": 3}
+          "added": {"archive": 5, "openalex": 3, "arxiv": 2, "semanticscholar": 1}
         }
     """
     source = body.get("source", "all").lower().strip()
-    if source not in ("archive", "openalex", "all"):
-        return _error(400, "source must be 'archive', 'openalex', or 'all'.")
+    if source not in ("archive", "openalex", "arxiv", "semanticscholar", "all"):
+        return _error(400, "source must be 'archive', 'openalex', 'arxiv', 'semanticscholar', or 'all'.")
     max_docs_raw = body.get("max_docs", 0)
     try:
         max_docs = int(max_docs_raw)
@@ -461,6 +461,14 @@ def _handle_kb_update(body: dict[str, Any]) -> dict[str, Any]:
             added["archive"] = rag.load_msr_archive(max_docs=max_docs)
         if source in ("openalex", "all"):
             added["openalex"] = rag.update_openalex(
+                max_docs=max_docs or None
+            )
+        if source in ("arxiv", "all"):
+            added["arxiv"] = rag.update_arxiv(
+                max_docs=max_docs or None
+            )
+        if source in ("semanticscholar", "all"):
+            added["semanticscholar"] = rag.update_semanticscholar(
                 max_docs=max_docs or None
             )
     except Exception as exc:  # noqa: BLE001
@@ -492,6 +500,8 @@ def _handle_scheduled_kb_update(event: dict[str, Any]) -> dict[str, Any]:
     try:
         added["archive"] = rag.load_msr_archive()
         added["openalex"] = rag.update_openalex()
+        added["arxiv"] = rag.update_arxiv()
+        added["semanticscholar"] = rag.update_semanticscholar()
     except Exception as exc:  # noqa: BLE001
         logger.exception("Scheduled KB update failed")
         return {"success": False, "error": str(exc)}

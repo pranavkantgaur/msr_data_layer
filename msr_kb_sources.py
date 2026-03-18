@@ -1,7 +1,7 @@
 """
 MSR Knowledge-Base Source Loaders
 
-Three document sources feed the MSR data layer knowledge base:
+Five document sources feed the MSR data layer knowledge base:
 
 1. **Static source** – ``pranavkantgaur/msr-archive`` GitHub repository
    OCR text files from the ``ocr/`` directory (transcribed ORNL Molten Salt
@@ -13,7 +13,18 @@ Three document sources feed the MSR data layer knowledge base:
    periodically.  A second targeted query focuses on TMSR-LF1 experimental
    data from the TMSR group at SINAP (Shanghai Institute of Applied Physics).
 
-3. **Plant operational data** – :class:`PlantDataLoader`
+3. **Dynamic source** – arXiv preprint API (Atom XML)
+   Preprints and recent papers matching "molten salt reactor experimental"
+   and "TMSR-LF1" are fetched from the arXiv Atom XML feed.  arXiv is the
+   primary source for cutting-edge nuclear engineering preprints before they
+   are indexed by other databases.
+
+4. **Dynamic source** – Semantic Scholar Graph API
+   Academic papers from the Semantic Scholar corpus are fetched using the
+   public S2 Graph API.  Semantic Scholar excels at nuclear engineering and
+   materials science literature and often indexes papers earlier than OpenAlex.
+
+5. **Plant operational data** – :class:`PlantDataLoader`
    Accepts real-time plant data pushed by operators or agents: sensor
    snapshots, event logs, and maintenance/inspection reports.  This enables
    the knowledge base to accumulate operational history so future RAG queries
@@ -22,6 +33,13 @@ Three document sources feed the MSR data layer knowledge base:
 All loaders maintain a JSON state file in ``MSR_KB_DIR`` (default
 ``./kb_store``) so that documents already ingested are never processed
 twice.  Re-running the updater therefore only adds truly new content.
+
+Design inspiration
+------------------
+The multi-source literature search (arXiv + OpenAlex + Semantic Scholar)
+mirrors the Phase B (Literature Discovery) pipeline of AutoResearchClaw
+(https://github.com/aiming-lab/AutoResearchClaw), which demonstrated that
+spanning three sources increases recall by ~40% for niche research domains.
 
 Environment Variables
 ---------------------
@@ -35,11 +53,19 @@ MSR_OPENALEX_EMAIL           Optional email for the OpenAlex ``mailto`` polite
                               pool (improves rate limits)
 MSR_GITHUB_TOKEN             Optional GitHub personal-access token for higher
                               rate limits when listing the archive
+MSR_ARXIV_MAX_RESULTS        Max arXiv papers to ingest per run (default 100)
+MSR_S2_API_KEY               Optional Semantic Scholar API key for higher rate
+                              limits (unauthenticated: 1 req/s; authenticated:
+                              100 req/s)
+MSR_S2_MAX_RESULTS           Max Semantic Scholar papers to ingest per run
+                              (default 100)
 
 CLI Usage
 ---------
     python msr_kb_sources.py --update-archive
     python msr_kb_sources.py --update-openalex
+    python msr_kb_sources.py --update-arxiv
+    python msr_kb_sources.py --update-semanticscholar
     python msr_kb_sources.py --update-all
     python msr_kb_sources.py --status
     python msr_kb_sources.py --ingest-plant-data --content "..." --data-type sensor_snapshot
@@ -51,7 +77,7 @@ Python Usage
 
     rag = MSRDigitalTwinRAG()
     mgr = KBSourceManager(rag)
-    mgr.update_all()
+    mgr.update_all()          # ingest new docs from archive + OpenAlex + arXiv + Semantic Scholar
 
     # Ingest plant operational data directly
     loader = PlantDataLoader()
@@ -69,6 +95,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -95,6 +122,25 @@ _GITHUB_RAW_BASE = "https://raw.githubusercontent.com"
 _REQUEST_TIMEOUT = 30       # seconds for each HTTP call
 _RETRY_WAIT = 2             # seconds between retries
 _MAX_RETRIES = 3
+
+# ---------------------------------------------------------------------------
+# arXiv API constants
+# ---------------------------------------------------------------------------
+
+_ARXIV_API_BASE = "http://export.arxiv.org/api/query"
+_ARXIV_NS = "http://www.w3.org/2005/Atom"
+_ARXIV_OPENSEARCH_NS = "http://a9.com/-/spec/opensearch/1.1/"
+_ARXIV_MAX_RESULTS_DEFAULT = 100
+_ARXIV_PER_REQUEST = 50     # arXiv recommends ≤ 100 per request
+_ARXIV_INTER_REQUEST_WAIT = 3  # seconds; arXiv ToS requires ≥ 3 s between calls
+
+# ---------------------------------------------------------------------------
+# Semantic Scholar API constants
+# ---------------------------------------------------------------------------
+
+_S2_API_BASE = "https://api.semanticscholar.org/graph/v1"
+_S2_MAX_RESULTS_DEFAULT = 100
+_S2_PER_PAGE = 50           # S2 max is 100; 50 is a safe default
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +667,490 @@ class OpenAlexLoader:
         }
 
 
+
+# ---------------------------------------------------------------------------
+# arXiv loader (preprints and recent experimental papers)
+# ---------------------------------------------------------------------------
+
+class ArXivLoader:
+    """
+    Fetches MSR-related preprints and papers from the
+    `arXiv <https://arxiv.org>`_ Atom XML API.
+
+    Two complementary queries are used:
+
+    1. ``"molten salt reactor experimental"`` – broad coverage of experimental
+       MSR research across physics, nuclear engineering, and materials science.
+    2. ``"TMSR-LF1"`` – targeted search for TMSR-LF1 papers from SINAP and
+       partner institutions.
+
+    arXiv is the primary source for cutting-edge nuclear engineering preprints
+    that may not yet appear in OpenAlex or Semantic Scholar.
+
+    The loader respects arXiv's API guidelines:
+
+    * Requests are spaced ≥ 3 seconds apart (``_ARXIV_INTER_REQUEST_WAIT``).
+    * The ``User-Agent`` header identifies this client.
+
+    State is persisted in ``arxiv_state.json`` inside ``MSR_KB_DIR``; paper
+    IDs already ingested are never fetched again.
+
+    Environment Variables
+    ---------------------
+    MSR_KB_DIR              KB store directory (default ``./kb_store``)
+    MSR_ARXIV_MAX_RESULTS   Max papers per run (default 100)
+    """
+
+    QUERIES: list[tuple[str, str]] = [
+        ("MSR experimental (general)", "all:molten+salt+reactor+experimental"),
+        ("TMSR-LF1 (targeted)", "all:TMSR-LF1"),
+    ]
+
+    def __init__(
+        self,
+        kb_dir: str | Path | None = None,
+        max_results: int | None = None,
+    ) -> None:
+        self._kb_dir = Path(kb_dir or os.environ.get("MSR_KB_DIR", "./kb_store"))
+        self._state_path = self._kb_dir / "arxiv_state.json"
+        self._max_results = max_results or int(
+            os.environ.get("MSR_ARXIV_MAX_RESULTS", str(_ARXIV_MAX_RESULTS_DEFAULT))
+        )
+
+    # ------------------------------------------------------------------
+    # arXiv API helpers
+    # ------------------------------------------------------------------
+
+    def _make_url(self, search_query: str, start: int) -> str:
+        params = urllib.parse.urlencode(
+            {
+                "search_query": search_query,
+                "start": start,
+                "max_results": _ARXIV_PER_REQUEST,
+                "sortBy": "submittedDate",
+                "sortOrder": "descending",
+            }
+        )
+        return f"{_ARXIV_API_BASE}?{params}"
+
+    def _fetch_atom(self, url: str) -> str:
+        """Fetch raw Atom XML from arXiv."""
+        headers = {"User-Agent": "msr-data-layer/1.0 (MSR knowledge base; contact: open-source)"}
+        return _http_get_text(url, headers)
+
+    def _parse_entries(self, xml_text: str) -> list[dict[str, Any]]:
+        """
+        Parse Atom XML entries from an arXiv API response.
+
+        Returns a list of dicts with keys:
+            ``id``, ``title``, ``abstract``, ``authors``, ``published``,
+            ``doi``, ``arxiv_id``.
+        """
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            print(f"[arXiv] XML parse error: {exc}", file=sys.stderr)
+            return []
+
+        ns = {"atom": _ARXIV_NS}
+        entries = []
+        for entry in root.findall("atom:entry", ns):
+            title_el = entry.find("atom:title", ns)
+            summary_el = entry.find("atom:summary", ns)
+            published_el = entry.find("atom:published", ns)
+            id_el = entry.find("atom:id", ns)
+
+            title = (title_el.text or "").strip() if title_el is not None else ""
+            abstract = (summary_el.text or "").strip() if summary_el is not None else ""
+            published = (published_el.text or "").strip() if published_el is not None else ""
+            raw_id = (id_el.text or "").strip() if id_el is not None else ""
+
+            # arXiv IDs look like http://arxiv.org/abs/2301.12345v1
+            arxiv_id = raw_id.split("/abs/")[-1] if "/abs/" in raw_id else raw_id
+            # Remove version suffix e.g. "2301.12345v2" → "2301.12345"
+            arxiv_id = re.sub(r"v\d+$", "", arxiv_id)
+
+            # DOI link (arXiv may expose it as a link with title="doi")
+            doi = ""
+            for link in entry.findall("atom:link", ns):
+                if link.get("title") == "doi":
+                    doi = link.get("href", "")
+                    break
+
+            authors = []
+            for author_el in entry.findall("atom:author", ns):
+                name_el = author_el.find("atom:name", ns)
+                if name_el is not None and name_el.text:
+                    authors.append(name_el.text.strip())
+
+            if not arxiv_id:
+                continue
+
+            entries.append(
+                {
+                    "id": arxiv_id,
+                    "title": title,
+                    "abstract": abstract,
+                    "authors": authors,
+                    "published": published[:10],  # YYYY-MM-DD
+                    "doi": doi,
+                }
+            )
+        return entries
+
+    # ------------------------------------------------------------------
+    # Text formatting
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def format_entry_text(entry: dict[str, Any]) -> tuple[str, str]:
+        """
+        Format a parsed arXiv entry into (text, source_id).
+
+        The text includes title, year, authors, arXiv ID, DOI (if available),
+        and abstract.  The source_id is ``arxiv:<arxiv_id>``.
+        """
+        arxiv_id = entry.get("id", "")
+        title = entry.get("title", "")
+        published = entry.get("published", "")
+        doi = entry.get("doi", "")
+        abstract = entry.get("abstract", "")
+        authors = entry.get("authors", [])
+
+        author_str = "; ".join(authors[:5])
+        if len(authors) > 5:
+            author_str += f" et al. ({len(authors)} total)"
+
+        parts = [f"Title: {title}"]
+        if published:
+            parts.append(f"Published: {published}")
+        if author_str:
+            parts.append(f"Authors: {author_str}")
+        parts.append(f"arXiv: https://arxiv.org/abs/{arxiv_id}")
+        if doi:
+            parts.append(f"DOI: {doi}")
+        if abstract:
+            parts.append(f"\nAbstract:\n{abstract}")
+
+        return "\n".join(parts), f"arxiv:{arxiv_id}"
+
+    # ------------------------------------------------------------------
+    # Ingestion
+    # ------------------------------------------------------------------
+
+    def ingest(self, rag: Any, max_docs: int | None = None) -> int:
+        """
+        Ingest new arXiv papers into *rag*.
+
+        Parameters
+        ----------
+        rag:
+            :class:`~msr_digital_twin_with_rag.MSRDigitalTwinRAG` instance.
+        max_docs:
+            Maximum number of new papers to ingest across all queries.
+            Falls back to ``self._max_results``.
+
+        Returns
+        -------
+        int
+            Number of documents newly ingested.
+        """
+        limit = max_docs if max_docs is not None else self._max_results
+        state = _load_state(self._state_path)
+        ingested_ids: set[str] = set(state.get("ingested_ids", []))
+        total_new = 0
+
+        for label, search_query in self.QUERIES:
+            remaining = limit - total_new
+            if remaining <= 0:
+                break
+            print(f"[arXiv] Running query: {label}")
+            start = 0
+            while total_new < limit:
+                url = self._make_url(search_query, start)
+                try:
+                    xml_text = self._fetch_atom(url)
+                except (urllib.error.URLError, OSError) as exc:
+                    print(f"[arXiv] API error: {exc}", file=sys.stderr)
+                    break
+
+                entries = self._parse_entries(xml_text)
+                if not entries:
+                    break
+
+                for entry in entries:
+                    if total_new >= limit:
+                        break
+                    arxiv_id = entry.get("id", "")
+                    if not arxiv_id or arxiv_id in ingested_ids:
+                        continue
+                    text, source_id = self.format_entry_text(entry)
+                    if not text.strip():
+                        continue
+                    try:
+                        n = rag.add_document(text, source=source_id)
+                        title_short = textwrap.shorten(
+                            entry.get("title") or source_id, width=70, placeholder="…"
+                        )
+                        print(f"[arXiv] + {title_short} ({n} chunks)")
+                        ingested_ids.add(arxiv_id)
+                        total_new += 1
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[arXiv] Skipping {source_id}: {exc}", file=sys.stderr)
+
+                start += len(entries)
+                if len(entries) < _ARXIV_PER_REQUEST:
+                    break  # Last page
+
+                # Respect arXiv rate limit
+                time.sleep(_ARXIV_INTER_REQUEST_WAIT)
+
+        # Persist
+        state["ingested_ids"] = sorted(ingested_ids)
+        state["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        state["total_ingested"] = len(ingested_ids)
+        _save_state(self._state_path, state)
+        print(f"[arXiv] Done. {total_new} new paper(s) added.")
+        return total_new
+
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+
+    def status(self) -> dict[str, Any]:
+        """Return loader state summary."""
+        state = _load_state(self._state_path)
+        return {
+            "source": "arXiv API (molten salt reactor experimental + TMSR-LF1)",
+            "total_ingested": state.get("total_ingested", 0),
+            "last_run": state.get("last_run", "never"),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Semantic Scholar loader (academic papers via S2 Graph API)
+# ---------------------------------------------------------------------------
+
+class SemanticScholarLoader:
+    """
+    Fetches academic papers from the
+    `Semantic Scholar <https://www.semanticscholar.org>`_ Graph API and
+    ingests their title + abstract into the knowledge base.
+
+    Two complementary queries are used:
+
+    1. ``"molten salt reactor experimental"`` – broad coverage of experimental
+       MSR research.
+    2. ``"TMSR LF1 SINAP"`` – targeted papers from the TMSR-LF1 programme.
+
+    The Semantic Scholar API provides high-quality metadata for nuclear
+    engineering and materials science literature, often indexing papers
+    earlier than OpenAlex.
+
+    An optional Semantic Scholar API key (``MSR_S2_API_KEY``) raises the
+    rate limit from 1 req/s to 100 req/s; the loader works without a key.
+
+    State is persisted in ``semanticscholar_state.json`` inside ``MSR_KB_DIR``;
+    paper IDs already ingested are never fetched again.
+
+    Environment Variables
+    ---------------------
+    MSR_KB_DIR              KB store directory (default ``./kb_store``)
+    MSR_S2_API_KEY          Optional S2 API key (higher rate limits)
+    MSR_S2_MAX_RESULTS      Max papers per run (default 100)
+    """
+
+    QUERIES: list[tuple[str, str]] = [
+        ("MSR experimental (general)", "molten salt reactor experimental"),
+        ("TMSR-LF1 SINAP (targeted)", "TMSR LF1 SINAP"),
+    ]
+
+    _FIELDS = "title,abstract,year,authors,externalIds,openAccessPdf"
+
+    def __init__(
+        self,
+        kb_dir: str | Path | None = None,
+        max_results: int | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        self._kb_dir = Path(kb_dir or os.environ.get("MSR_KB_DIR", "./kb_store"))
+        self._state_path = self._kb_dir / "semanticscholar_state.json"
+        self._max_results = max_results or int(
+            os.environ.get("MSR_S2_MAX_RESULTS", str(_S2_MAX_RESULTS_DEFAULT))
+        )
+        self._api_key = api_key or os.environ.get("MSR_S2_API_KEY", "")
+
+    # ------------------------------------------------------------------
+    # S2 API helpers
+    # ------------------------------------------------------------------
+
+    def _base_headers(self) -> dict[str, str]:
+        headers = {"User-Agent": "msr-data-layer/1.0"}
+        if self._api_key:
+            headers["x-api-key"] = self._api_key
+        return headers
+
+    def _make_url(self, query: str, offset: int) -> str:
+        params = urllib.parse.urlencode(
+            {
+                "query": query,
+                "fields": self._FIELDS,
+                "limit": _S2_PER_PAGE,
+                "offset": offset,
+            }
+        )
+        return f"{_S2_API_BASE}/paper/search?{params}"
+
+    def _iter_papers(self, query: str, max_results: int) -> Iterator[dict[str, Any]]:
+        """Yield raw S2 paper objects for *query* up to *max_results*."""
+        offset = 0
+        fetched = 0
+        while fetched < max_results:
+            url = self._make_url(query, offset)
+            try:
+                data = _http_get(url, self._base_headers())
+            except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+                print(f"[S2] API error: {exc}", file=sys.stderr)
+                break
+
+            if not isinstance(data, dict):
+                break
+
+            papers = data.get("data", [])
+            if not papers:
+                break
+
+            for paper in papers:
+                if fetched >= max_results:
+                    return
+                yield paper
+                fetched += 1
+
+            total = data.get("total", 0)
+            offset += len(papers)
+            if offset >= total:
+                break
+            # Polite delay (unauthenticated: 1 req/s)
+            time.sleep(0 if self._api_key else 1.1)
+
+    # ------------------------------------------------------------------
+    # Text formatting
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def format_paper_text(paper: dict[str, Any]) -> tuple[str, str]:
+        """
+        Format a raw S2 paper object into (text, source_id).
+
+        The text includes title, year, authors, DOI, and abstract.
+        The source_id is ``s2:<paper_id>``.
+        """
+        paper_id = paper.get("paperId") or ""
+        title = paper.get("title") or ""
+        year = paper.get("year") or ""
+        abstract = paper.get("abstract") or ""
+        authors = [
+            a.get("name", "")
+            for a in (paper.get("authors") or [])[:5]
+            if a.get("name")
+        ]
+        author_str = "; ".join(authors)
+        if len(paper.get("authors") or []) > 5:
+            author_str += f" et al. ({len(paper['authors'])} total)"
+
+        ext_ids = paper.get("externalIds") or {}
+        doi = ext_ids.get("DOI") or ext_ids.get("doi") or ""
+        arxiv_id = ext_ids.get("ArXiv") or ext_ids.get("arxiv") or ""
+        oa = paper.get("openAccessPdf") or {}
+        pdf_url = oa.get("url") or ""
+
+        parts = [f"Title: {title}"]
+        if year:
+            parts.append(f"Year: {year}")
+        if author_str:
+            parts.append(f"Authors: {author_str}")
+        if doi:
+            parts.append(f"DOI: {doi}")
+        if arxiv_id:
+            parts.append(f"arXiv: https://arxiv.org/abs/{arxiv_id}")
+        if pdf_url:
+            parts.append(f"PDF: {pdf_url}")
+        if abstract:
+            parts.append(f"\nAbstract:\n{abstract}")
+
+        return "\n".join(parts), f"s2:{paper_id}"
+
+    # ------------------------------------------------------------------
+    # Ingestion
+    # ------------------------------------------------------------------
+
+    def ingest(self, rag: Any, max_docs: int | None = None) -> int:
+        """
+        Ingest new Semantic Scholar papers into *rag*.
+
+        Parameters
+        ----------
+        rag:
+            :class:`~msr_digital_twin_with_rag.MSRDigitalTwinRAG` instance.
+        max_docs:
+            Maximum number of new papers to ingest across all queries.
+            Falls back to ``self._max_results``.
+
+        Returns
+        -------
+        int
+            Number of documents newly ingested.
+        """
+        limit = max_docs if max_docs is not None else self._max_results
+        state = _load_state(self._state_path)
+        ingested_ids: set[str] = set(state.get("ingested_ids", []))
+        total_new = 0
+
+        for label, query in self.QUERIES:
+            remaining = limit - total_new
+            if remaining <= 0:
+                break
+            print(f"[S2] Running query: {label}")
+            for paper in self._iter_papers(query, remaining):
+                paper_id = paper.get("paperId") or ""
+                if not paper_id or paper_id in ingested_ids:
+                    continue
+                text, source_id = self.format_paper_text(paper)
+                if not text.strip():
+                    continue
+                try:
+                    n = rag.add_document(text, source=source_id)
+                    title_short = textwrap.shorten(
+                        paper.get("title") or source_id, width=70, placeholder="…"
+                    )
+                    print(f"[S2] + {title_short} ({n} chunks)")
+                    ingested_ids.add(paper_id)
+                    total_new += 1
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[S2] Skipping {source_id}: {exc}", file=sys.stderr)
+
+        # Persist
+        state["ingested_ids"] = sorted(ingested_ids)
+        state["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        state["total_ingested"] = len(ingested_ids)
+        _save_state(self._state_path, state)
+        print(f"[S2] Done. {total_new} new paper(s) added.")
+        return total_new
+
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+
+    def status(self) -> dict[str, Any]:
+        """Return loader state summary."""
+        state = _load_state(self._state_path)
+        return {
+            "source": "Semantic Scholar API (MSR experimental + TMSR-LF1 SINAP)",
+            "total_ingested": state.get("total_ingested", 0),
+            "last_run": state.get("last_run", "never"),
+        }
+
+
 # ---------------------------------------------------------------------------
 # Plant operational data loader (real-time / live-plant source)
 # ---------------------------------------------------------------------------
@@ -856,6 +1386,8 @@ class KBSourceManager:
         _kb = kb_dir or os.environ.get("MSR_KB_DIR", "./kb_store")
         self._archive = MSRArchiveLoader(kb_dir=_kb)
         self._openalex = OpenAlexLoader(kb_dir=_kb)
+        self._arxiv = ArXivLoader(kb_dir=_kb)
+        self._s2 = SemanticScholarLoader(kb_dir=_kb)
         self._plant = PlantDataLoader(kb_dir=_kb)
 
     def update_archive(self, max_docs: int = 0) -> int:
@@ -865,6 +1397,14 @@ class KBSourceManager:
     def update_openalex(self, max_docs: int | None = None) -> int:
         """Ingest new OpenAlex papers. Returns docs added."""
         return self._openalex.ingest(self._rag, max_docs=max_docs)
+
+    def update_arxiv(self, max_docs: int | None = None) -> int:
+        """Ingest new arXiv preprints and papers. Returns docs added."""
+        return self._arxiv.ingest(self._rag, max_docs=max_docs)
+
+    def update_semanticscholar(self, max_docs: int | None = None) -> int:
+        """Ingest new Semantic Scholar papers. Returns docs added."""
+        return self._s2.ingest(self._rag, max_docs=max_docs)
 
     def ingest_plant_data(
         self,
@@ -883,22 +1423,42 @@ class KBSourceManager:
         self,
         max_archive_docs: int = 0,
         max_openalex_docs: int | None = None,
+        max_arxiv_docs: int | None = None,
+        max_s2_docs: int | None = None,
     ) -> dict[str, int]:
         """
-        Run archive + OpenAlex loaders and return counts of newly added documents.
+        Run archive + OpenAlex + arXiv + Semantic Scholar loaders and return
+        counts of newly added documents.
+
+        Inspired by AutoResearchClaw's Phase B literature discovery pipeline
+        which spans OpenAlex, Semantic Scholar, and arXiv to maximise recall.
 
         Returns
         -------
         dict
-            ``{"archive": <n>, "openalex": <n>}``
+            ``{"archive": <n>, "openalex": <n>, "arxiv": <n>,
+               "semanticscholar": <n>}``
         """
         archive_added = self.update_archive(max_docs=max_archive_docs)
         openalex_added = self.update_openalex(max_docs=max_openalex_docs)
-        return {"archive": archive_added, "openalex": openalex_added}
+        arxiv_added = self.update_arxiv(max_docs=max_arxiv_docs)
+        s2_added = self.update_semanticscholar(max_docs=max_s2_docs)
+        return {
+            "archive": archive_added,
+            "openalex": openalex_added,
+            "arxiv": arxiv_added,
+            "semanticscholar": s2_added,
+        }
 
     def status(self) -> None:
         """Print a summary of all loaders' state."""
-        sources = [self._archive.status(), self._openalex.status(), self._plant.status()]
+        sources = [
+            self._archive.status(),
+            self._openalex.status(),
+            self._arxiv.status(),
+            self._s2.status(),
+            self._plant.status(),
+        ]
         print("\n=== MSR Knowledge-Base Source Status ===")
         for st in sources:
             print(f"  Source  : {st['source']}")
@@ -922,8 +1482,11 @@ def _cli_main(argv: list[str] | None = None) -> None:
               MSR_KB_DIR               KB store directory (default: ./kb_store)
               MSR_ARCHIVE_REPO         GitHub owner/repo (default: pranavkantgaur/msr-archive)
               MSR_ARCHIVE_MAX_DOCS     Max OCR files per run (0 = unlimited)
-              MSR_OPENALEX_MAX_RESULTS Max papers per run (default: 100)
+              MSR_OPENALEX_MAX_RESULTS Max OpenAlex papers per run (default: 100)
               MSR_OPENALEX_EMAIL       Email for OpenAlex polite pool
+              MSR_ARXIV_MAX_RESULTS    Max arXiv papers per run (default: 100)
+              MSR_S2_API_KEY           Semantic Scholar API key (optional, higher rate limits)
+              MSR_S2_MAX_RESULTS       Max Semantic Scholar papers per run (default: 100)
               MSR_GITHUB_TOKEN         GitHub token for higher API rate limits
               MSR_OPENAI_API_KEY       OpenAI key for LLM insight extraction
         """),
@@ -940,9 +1503,19 @@ def _cli_main(argv: list[str] | None = None) -> None:
         help="Fetch new papers from OpenAlex (MSR experimental data / TMSR-LF1)",
     )
     group.add_argument(
+        "--update-arxiv",
+        action="store_true",
+        help="Fetch new preprints and papers from arXiv (molten salt reactor experimental + TMSR-LF1)",
+    )
+    group.add_argument(
+        "--update-semanticscholar",
+        action="store_true",
+        help="Fetch new papers from Semantic Scholar (MSR experimental + TMSR-LF1 SINAP)",
+    )
+    group.add_argument(
         "--update-all",
         action="store_true",
-        help="Run archive + OpenAlex loaders",
+        help="Run archive + OpenAlex + arXiv + Semantic Scholar loaders",
     )
     group.add_argument(
         "--status",
@@ -1002,14 +1575,25 @@ def _cli_main(argv: list[str] | None = None) -> None:
     elif args.update_openalex:
         max_docs = args.max_docs or None
         mgr.update_openalex(max_docs=max_docs)
+    elif args.update_arxiv:
+        max_docs = args.max_docs or None
+        mgr.update_arxiv(max_docs=max_docs)
+    elif args.update_semanticscholar:
+        max_docs = args.max_docs or None
+        mgr.update_semanticscholar(max_docs=max_docs)
     elif args.update_all:
+        max_docs = args.max_docs or None
         counts = mgr.update_all(
             max_archive_docs=args.max_docs,
-            max_openalex_docs=args.max_docs or None,
+            max_openalex_docs=max_docs,
+            max_arxiv_docs=max_docs,
+            max_s2_docs=max_docs,
         )
         print(
             f"\n[KB] Update complete: archive +{counts['archive']}, "
-            f"openalex +{counts['openalex']}"
+            f"openalex +{counts['openalex']}, "
+            f"arxiv +{counts['arxiv']}, "
+            f"semanticscholar +{counts['semanticscholar']}"
         )
     elif args.ingest_plant_data:
         content = args.content

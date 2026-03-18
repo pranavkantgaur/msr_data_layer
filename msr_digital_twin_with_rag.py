@@ -1177,6 +1177,50 @@ class MSRDigitalTwinRAG:
         loader = OpenAlexLoader()
         return loader.ingest(self, max_docs=max_docs)
 
+    def update_arxiv(self, max_docs: int | None = None) -> int:
+        """
+        Ingest new preprints and papers from the arXiv API (molten salt
+        reactor experimental and TMSR-LF1 targeted queries).
+
+        Delegates to :class:`~msr_kb_sources.ArXivLoader`.
+
+        Parameters
+        ----------
+        max_docs:
+            Maximum number of new papers to ingest (``None`` uses the
+            ``MSR_ARXIV_MAX_RESULTS`` env var, default 100).
+
+        Returns
+        -------
+        int
+            Number of documents newly added.
+        """
+        from msr_kb_sources import ArXivLoader  # noqa: PLC0415
+        loader = ArXivLoader()
+        return loader.ingest(self, max_docs=max_docs)
+
+    def update_semanticscholar(self, max_docs: int | None = None) -> int:
+        """
+        Ingest new papers from the Semantic Scholar Graph API (MSR
+        experimental and TMSR-LF1 SINAP targeted queries).
+
+        Delegates to :class:`~msr_kb_sources.SemanticScholarLoader`.
+
+        Parameters
+        ----------
+        max_docs:
+            Maximum number of new papers to ingest (``None`` uses the
+            ``MSR_S2_MAX_RESULTS`` env var, default 100).
+
+        Returns
+        -------
+        int
+            Number of documents newly added.
+        """
+        from msr_kb_sources import SemanticScholarLoader  # noqa: PLC0415
+        loader = SemanticScholarLoader()
+        return loader.ingest(self, max_docs=max_docs)
+
     def answer(self, question: str, top_k: int = 5) -> str:
         """
         Answer *question* using the multi-step RAG pipeline.

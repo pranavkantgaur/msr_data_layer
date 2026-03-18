@@ -97,6 +97,8 @@ def mock_rag():
     rag.answer.return_value = "The thermal efficiency is approximately 40%."
     rag.load_msr_archive.return_value = 3
     rag.update_openalex.return_value = 2
+    rag.update_arxiv.return_value = 1
+    rag.update_semanticscholar.return_value = 1
     return rag
 
 
@@ -356,7 +358,9 @@ class TestKBUpdateEndpoint:
         body = json.loads(resp["body"])
         assert body["added"]["archive"] == 3
         assert body["added"]["openalex"] == 2
-        assert body["total_new_documents"] == 5
+        assert body["added"]["arxiv"] == 1
+        assert body["added"]["semanticscholar"] == 1
+        assert body["total_new_documents"] == 7
 
     def test_update_default_source_is_all(self, mock_rag):
         import lambda_function as lf
@@ -368,6 +372,8 @@ class TestKBUpdateEndpoint:
         assert resp["statusCode"] == 200
         assert "archive" in body["added"]
         assert "openalex" in body["added"]
+        assert "arxiv" in body["added"]
+        assert "semanticscholar" in body["added"]
 
     def test_max_docs_passed_to_loader(self, mock_rag):
         import lambda_function as lf
@@ -383,6 +389,30 @@ class TestKBUpdateEndpoint:
         event = _apigw_event("POST", "/kb/update", body={"source": "unknown"})
         resp = lf.lambda_handler(event, None)
         assert resp["statusCode"] == 400
+
+    def test_update_arxiv_source(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        event = _apigw_event("POST", "/kb/update", body={"source": "arxiv"})
+        with patch.object(lf, "sync_kb_to_s3"):
+            resp = lf.lambda_handler(event, None)
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["added"]["arxiv"] == 1
+        assert "openalex" not in body["added"]
+        mock_rag.update_arxiv.assert_called_once_with(max_docs=None)
+
+    def test_update_semanticscholar_source(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        event = _apigw_event("POST", "/kb/update", body={"source": "semanticscholar"})
+        with patch.object(lf, "sync_kb_to_s3"):
+            resp = lf.lambda_handler(event, None)
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["added"]["semanticscholar"] == 1
+        assert "archive" not in body["added"]
+        mock_rag.update_semanticscholar.assert_called_once_with(max_docs=None)
 
     def test_update_error_returns_500(self, mock_rag):
         import lambda_function as lf
@@ -407,8 +437,12 @@ class TestScheduledUpdate:
         assert result["success"] is True
         assert result["added"]["archive"] == 3
         assert result["added"]["openalex"] == 2
+        assert result["added"]["arxiv"] == 1
+        assert result["added"]["semanticscholar"] == 1
         mock_rag.load_msr_archive.assert_called_once()
         mock_rag.update_openalex.assert_called_once()
+        mock_rag.update_arxiv.assert_called_once()
+        mock_rag.update_semanticscholar.assert_called_once()
         mock_sync.assert_called_once()
 
     def test_scheduled_event_failure_returns_error_dict(self, mock_rag):
