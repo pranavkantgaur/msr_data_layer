@@ -65,6 +65,9 @@ No hardcoded secrets are permitted. Use environment variables (see below).
 | `MSR_KB_DIR` | Optional | Persistent KB directory (default: `./kb_store`) |
 | `MSR_DOCS_DIR` | Optional | Reference docs directory (default: `./docs`) |
 | `MSR_USE_LOCAL_GPU` | Optional | `true` to use local GPU sentence-transformers |
+| `MSR_ARXIV_MAX_RESULTS` | Optional | Max arXiv papers per run (default: 100) |
+| `MSR_S2_API_KEY` | Optional | Semantic Scholar API key for higher rate limits (100 req/s vs 1 req/s) |
+| `MSR_S2_MAX_RESULTS` | Optional | Max Semantic Scholar papers per run (default: 100) |
 
 Copy `samconfig.toml.example` → `samconfig.toml` (excluded from git) and
 `DEPLOYMENT_CREDENTIALS.md` for deployment guidance — never commit real secrets.
