@@ -28,6 +28,7 @@ data-layer capability, providing:
 | [xue_2026_prhrs_transient_evaluation.md](xue_2026_prhrs_transient_evaluation.md) | Xue S. et al., *Ann. Nucl. Energy* | Transient performance evaluation of passive residual heat removal system in liquid molten salt reactor (RELAP5-TMSR) | 2026 |
 | [yang_2025_msp_pump_thermal_optimisation.md](yang_2025_msp_pump_thermal_optimisation.md) | Yang J. et al., SINAP/CAS | Thermal resistance optimisation of high-temperature molten salt pump via RSM and NSGA-II (10.3 °C bearing temperature reduction) | 2025 |
 | [wang_2026_resta3d_tmsr_transient_safety.md](wang_2026_resta3d_tmsr_transient_safety.md) | Wang K. et al., SINAP/CAS, *Ann. Nucl. Energy* | RESTA-3D reactor dynamics code with DNP transport and N-TH coupling — validation against MSRE and 2 MWth TMSR transient safety analysis | 2026 |
+| [economics_finance_msr_2020.md](economics_finance_msr_2020.md) | *Progress in Nuclear Energy*, PII S0149197020302511 | Techno-economic and financial analysis of MSR deployment: OCC estimation, LCOE sensitivity, financing structures (RAB/loan guarantee), learning curves, and carbon-price policy scenarios | 2020 |
 
 ---
 
