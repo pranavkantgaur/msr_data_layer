@@ -1,122 +1,123 @@
 # MSR Data Layer
 
-A **data layer for Molten Salt Reactor (MSR) design, construction, and operations**,
-exposed through the [Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io).
+A **reference data layer for Molten Salt Reactor (MSR) design, construction, and
+operations** — powered by your GitHub Copilot subscription, zero cloud bills.
 
-The repo serves as a **knowledge-base and live-data interface** so that LLM agents
-(Claude, GitHub Copilot, custom agents) and human operators can:
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/pranavkantgaur/msr_data_layer)
 
-* **Query reference documents** – historical ORNL MSR reports, academic papers,
-  maintenance logs, and plant operational data via an enhanced multi-step
-  Retrieval-Augmented Generation (RAG) pipeline.
-* **Read live plant data** – sensor readings and alarms from an external plant data
-  source (SCADA, historian, or digital twin API), or a development stub when no
-  external URL is configured.
-* **Ingest operational data** – push real-time sensor snapshots, event logs, and
-  maintenance reports into the knowledge base so future queries incorporate actual
-  plant experience.
-
-The repo is **not** a digital twin itself.  It is designed to work alongside an
-existing digital twin or simulation tool by acting as its knowledge and data layer.
-
-The RAG implementation is inspired by the
-[open-notebook](https://github.com/lfnovo/open-notebook) project,
-adopting its multi-query decomposition, source-insight extraction, and
-parallel-search approach.
+> **One-click demo** — click the badge above, wait ~60 s, and a public
+> `https://<codespace>-8000.app.github.dev` URL appears in the *Ports* panel.
+> Paste it into the [demo notebook](use_cases/lucas_et_al_2025_demo.ipynb) and
+> run it end-to-end in Colab.  No AWS account, no API key purchase needed —
+> your GitHub Copilot Pro subscription covers everything.
 
 ---
 
-## Repository Contents
+## What it does
 
-| File | Description |
-|---|---|
-| `msr_mcp_server.py` | MCP server – read-only data tools + `ingest_plant_data`; configurable external data source |
-| `msr_mcp_server_main.py` | Entry point – stdio transport server |
-| `msr_digital_twin_client.py` | Python client for the MCP server (`MSRDataLayerClient`) |
-| `msr_digital_twin_with_rag.py` | Enhanced multi-step RAG pipeline (+ GPU engines) |
-| `msr_kb_sources.py` | KB source loaders: msr-archive, OpenAlex, and `PlantDataLoader` |
-| `lambda_function.py` | AWS Lambda handler (HTTP API + EventBridge + `/data/ingest`) |
-| `template.yaml` | AWS SAM template (Lambda + API Gateway + S3 + GPU variant) |
-| `Dockerfile.gpu` | GPU-capable container image (CUDA + sentence-transformers + transformers) |
-| `Makefile` | Build / deploy / local-dev / GPU container targets |
-| `requirements_mcp.txt` | Core Python dependencies |
-| `requirements_lambda.txt` | Lambda-specific dependencies (adds boto3) |
-| `requirements_gpu.txt` | GPU-specific dependencies (torch, sentence-transformers, transformers) |
-| `00_MCP_START_HERE.md` | Quick-start guide (data layer tools, client usage) |
-| `MSR_DIGITAL_TWIN_MCP_GUIDE.md` | Full guide – architecture, tool reference, RAG pipeline, "what we don't do" |
-| `MSR_MCP_DEPLOYMENT_GUIDE.md` | Deployment and production guide |
-| `test_msr_mcp_server.py` | Unit tests for MCP server |
-| `test_msr_rag.py` | Unit tests for RAG pipeline (including GPU engine tests) |
-| `test_msr_kb_sources.py` | Unit tests for KB source loaders (including PlantDataLoader) |
-| `test_lambda_function.py` | Unit tests for Lambda handler |
+The data layer gives LLM agents and human operators a single interface to:
+
+* **Query research knowledge** — ORNL MSR reports (full text), auto-fetched
+  paper abstracts (OpenAlex / arXiv / Semantic Scholar), and user-provided
+  full paper text — all searchable via multi-step RAG.
+* **Ingest plant timeseries** — push timestamped sensor readings from
+  SCADA/instruments and query them with structured filters or plain English
+  (NL→SQL backed by SQLite).
+* **Ingest operational records** — event logs, maintenance reports, ICP-OES
+  results, corrosion measurements, etc.
+* **Read live sensor state** — from an external plant REST API or a built-in
+  development stub.
+
+> **Not** a digital twin, simulation, or control system.  This is read +
+> ingest only.  No actuation tools.
 
 ---
 
-## Quick Start
+## Two interfaces, one KB
 
-### 1 – Install dependencies
-
-```bash
-pip install -r requirements_mcp.txt
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                     Shared KB + Timeseries Store                   │
+│          (./kb_store/  +  plant_timeseries.db  — SQLite)          │
+└──────────────────────┬────────────────────────────────────────────┘
+                       │
+          ┌────────────┴────────────┐
+          │                         │
+   ┌──────▼──────┐           ┌──────▼──────────────┐
+   │  server.py  │           │ msr_mcp_server_      │
+   │  HTTP :8000 │           │ main.py  (stdio)     │
+   │             │           │                      │
+   │ Human ops   │           │ AI agents:           │
+   │ Notebooks   │           │ GitHub Copilot Chat  │
+   │ REST APIs   │           │ Claude Desktop       │
+   └─────────────┘           │ Custom MCP clients   │
+                             └──────────────────────┘
 ```
 
-### 2 – Run the demo client
-
-```bash
-python msr_digital_twin_client.py
-```
-
-### 3 – Query the knowledge base with RAG
-
-```bash
-# Without LLM – returns enriched context (hybrid vector + TF-IDF retrieval)
-python msr_digital_twin_with_rag.py "What is the current core temperature?"
-
-# With LLM – multi-step RAG: decompose → parallel search → synthesize
-export MSR_OPENAI_API_KEY=sk-...
-python msr_digital_twin_with_rag.py "Is the plant operating within safe limits?"
-```
-
-### 4 – Connect to a live plant data source
-
-```bash
-# Set the URL of your SCADA/historian/digital twin REST API
-export MSR_PLANT_DATA_URL=https://your-scada.example.com/api/plant/state
-
-# The MCP server will now read live data from that URL instead of the stub
-python msr_mcp_server_main.py
-```
-
-### 5 – Connect Claude Desktop
-
-Add to `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "msr-data-layer": {
-      "command": "python",
-      "args": ["/path/to/msr_mcp_server_main.py"]
-    }
-  }
-}
-```
-
----
-
-## MCP Tools
-
-The data layer exposes 7 tools via the Model Context Protocol:
-
-| Tool | Type | Description |
+| Component | Start command | Used by |
 |---|---|---|
-| `get_reactor_status` | Read | Current plant operational status (power, temperature, last-updated) |
-| `get_sensor_reading` | Read | Latest value of a named sensor |
-| `get_all_sensor_readings` | Read | All sensor values in one call |
-| `get_sensor_history` | Read | Last N readings for a sensor (in-memory session buffer) |
-| `get_active_alarms` | Read | Currently active safety/operational alarms |
-| `get_data_source_info` | Read | Data source configuration and connectivity status |
-| `ingest_plant_data` | Write | Push operational data into the RAG knowledge base |
+| `server.py` | `make serve` or `python server.py` | Demo notebooks, REST clients, human operators |
+| `msr_mcp_server_main.py` | `make serve-mcp` or `python msr_mcp_server_main.py` | AI agents via MCP protocol |
+
+Both components share the same KB files — you can run one, the other, or both
+simultaneously.
+
+---
+
+## Quick start (GitHub Codespaces — recommended)
+
+1. Click **"Open in GitHub Codespaces"** above (or badge in the GitHub UI).
+2. Wait ~60 s for the container to build and `server.py` to start.
+3. In the *Ports* tab, the port 8000 URL is already **public** — copy it.
+4. Open [`use_cases/lucas_et_al_2025_demo.ipynb`](use_cases/lucas_et_al_2025_demo.ipynb)
+   in Google Colab, paste the URL, and run all cells.
+
+The server uses your Codespace's `GITHUB_TOKEN` automatically — no extra
+setup required.
+
+## Quick start (local)
+
+```bash
+# Install dependencies
+pip install -r requirements_mcp.txt
+
+# Start the HTTP server (port 8000)
+make serve              # same as: python server.py
+
+# Or start the MCP stdio server for AI agents
+make serve-mcp          # same as: python msr_mcp_server_main.py
+
+# Run tests
+make test
+```
+
+Set `MSR_GITHUB_TOKEN` to your GitHub PAT (with `models:read` scope) or
+`MSR_OPENAI_API_KEY` for LLM-backed RAG synthesis and NL→SQL.  Without these,
+the service works in stub mode (random-projection embeddings, no synthesis).
+
+---
+
+## Repository layout
+
+| File / dir | Description |
+|---|---|
+| `server.py` | **Primary HTTP server** — wraps lambda_function.py; start with `make serve` |
+| `msr_mcp_server_main.py` | **MCP stdio server** — for AI agents; start with `make serve-mcp` |
+| `msr_mcp_server.py` | MCP tool definitions + handler functions |
+| `msr_digital_twin_with_rag.py` | Multi-step RAG pipeline (chunking, embeddings, retrieval, synthesis) |
+| `msr_kb_sources.py` | KB loaders: ORNL archive, OpenAlex, arXiv, Semantic Scholar, plant data, `TimeseriesStore` |
+| `lambda_function.py` | HTTP router (used by `server.py`; also AWS Lambda handler — optional) |
+| `template.yaml` | AWS SAM template (optional cloud deployment) |
+| `Dockerfile.gpu` | GPU container image (optional) |
+| `Makefile` | All build/test/serve targets |
+| `requirements_mcp.txt` | Core Python deps (no GPU, no AWS) |
+| `requirements_lambda.txt` | Lambda-specific deps (adds boto3) |
+| `requirements_gpu.txt` | GPU deps (torch, sentence-transformers) |
+| `.devcontainer/` | GitHub Codespaces auto-start config |
+| `use_cases/` | Demo notebooks and worked examples |
+| `docs/architecture/` | Architecture diagrams (Mermaid) |
+| `.ai/` | Agent grounding documents |
+| `test_*.py` | Unit tests (pytest) |
 
 > **No simulation or control-actuation tools are exposed.**  This is a data
 > layer – it reads from and ingests into external sources, not from a
@@ -636,7 +637,7 @@ are passed through via the SAM template parameters.
 
 ---
 
-## MCP Tools (read-only + ingestion)
+## MCP Tools (read + timeseries + ingestion)
 
 | Tool | Type | Description |
 |---|---|---|
@@ -646,7 +647,11 @@ are passed through via the SAM template parameters.
 | `get_sensor_history` | Read | Historical readings (up to last 100 samples) |
 | `get_active_alarms` | Read | List active alarms |
 | `get_data_source_info` | Read | Data source mode, URL, connectivity status |
-| `ingest_plant_data` | Write | Push operational data into the RAG knowledge base |
+| `query_sensor_timeseries` | Timeseries | Time-range or latest-N raw sensor readings from SQLite |
+| `get_sensor_stats` | Timeseries | avg / min / max / count aggregates over a sensor |
+| `query_plant_data_nl` | Timeseries | Natural-language question → LLM-generated SQL → results |
+| `ingest_plant_data` | Write | Push operational text/logs into the RAG knowledge base |
+| `ingest_full_paper_text` | Write | Upgrade an abstract-only KB entry to full paper text |
 
 > Simulation tools (`run_thermal_simulation`) and control-actuation tools
 > (`set_control_rod_position`, `acknowledge_alarm`) are **not** included.
@@ -655,28 +660,54 @@ are passed through via the SAM template parameters.
 
 ---
 
+## HTTP Endpoints
+
+All endpoints available at the Codespace public URL or `http://localhost:8000`:
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness check |
+| `POST` | `/mcp` | JSON-RPC 2.0 MCP protocol |
+| `POST` | `/query` | Plain-text RAG question → answer |
+| `POST` | `/kb/update` | Trigger KB ingestion (archive / papers) |
+| `POST` | `/data/ingest` | Push plant operational data (text / event logs) |
+| `POST` | `/timeseries/ingest` | Push timestamped sensor readings |
+| `POST` | `/timeseries/query` | Query sensor timeseries (structured or natural language) |
+
+---
+
 ## Architecture
 
 ```
-MCP Host (Claude / agent)
-        │  stdin/stdout JSON-RPC 2.0
-        ▼
-msr_mcp_server_main.py
-        │
-        ▼
-msr_mcp_server.py  ── read tools ── external plant data API (MSR_PLANT_DATA_URL)
-                              │                └── development stub (fallback)
-                              └── ingest_plant_data ──► MSRDigitalTwinRAG
+╔══════════════════════════════════════════════════════════════════╗
+║               Shared Knowledge Base + Timeseries Store            ║
+║   ./kb_store/ (vector + TF-IDF)  +  plant_timeseries.db (SQLite) ║
+╚══════════════╤═══════════════════════════════╤════════════════════╝
+               │                               │
+    ┌──────────▼──────────┐        ┌───────────▼──────────────┐
+    │    server.py        │        │  msr_mcp_server_main.py  │
+    │    HTTP :8000       │        │  (stdio MCP transport)   │
+    │    make serve       │        │  make serve-mcp          │
+    │                     │        │                          │
+    │  POST /query        │        │  GitHub Copilot Chat     │
+    │  POST /data/ingest  │        │  Claude Desktop          │
+    │  POST /timeseries/* │        │  Custom MCP agents       │
+    │  GET  /health       │        └──────────────────────────┘
+    └─────────────────────┘
 
-msr_digital_twin_with_rag.py  (inspired by open-notebook)
-  ├── LocalGPUEmbeddingEngine (sentence-transformers, CUDA/MPS/CPU)
-  ├── OpenAIEmbeddingEngine   (OpenAI Embeddings API)
-  ├── RandomProjectionEmbeddingEngine (numpy fallback, no external deps)
-  ├── KnowledgeBase (hybrid dense+TF-IDF, persistent)
-  ├── SourceInsight (LLM-generated summary/topics/key_facts)
-  ├── _decompose_query() (multi-query strategy via LLM)
-  ├── MSRDigitalTwinRAG._run_sub_query() (parallel search + extraction)
-  └── MSRDigitalTwinRAG._synthesize() (final answer synthesis)
+msr_digital_twin_with_rag.py  (RAG pipeline)
+  ├── LocalGPUEmbeddingEngine   (optional – sentence-transformers)
+  ├── OpenAIEmbeddingEngine     (GitHub Models / OpenAI API)
+  ├── RandomProjectionEngine    (numpy fallback – zero deps)
+  └── KnowledgeBase             (hybrid dense+TF-IDF, persistent)
+
+msr_kb_sources.py  (data loaders)
+  ├── MSRArchiveLoader     – ORNL reports full text (msr-archive)
+  ├── OpenAlexLoader       – paper abstracts (auto; full text on request)
+  ├── ArXivLoader          – paper abstracts (auto; full text on request)
+  ├── SemanticScholarLoader– paper abstracts (auto; full text on request)
+  ├── PlantDataLoader      – operational records, event logs
+  └── TimeseriesStore      – SQLite: timestamped sensor readings
 ```
 
 ---
@@ -684,10 +715,11 @@ msr_digital_twin_with_rag.py  (inspired by open-notebook)
 ## Testing
 
 ```bash
-pytest -v
+make test
+# or: python -m pytest test_*.py -v
 ```
 
-53 unit tests covering the MCP server (19) and enhanced RAG pipeline (53, including 19 GPU engine tests), plus 55 tests for the KB source loaders (including 15 PlantDataLoader tests) and 55 tests for the Lambda handler (174 total).
+204+ unit tests covering all components. Run with `--tb=short` for brevity.
 
 ---
 
@@ -695,28 +727,24 @@ pytest -v
 
 | Variable | Default | Description |
 |---|---|---|
-| `MSR_OPENAI_API_KEY` | _(unset)_ | API key for LLM + embeddings |
+| `MSR_GITHUB_TOKEN` | _(unset)_ | **Recommended**: GitHub PAT for GitHub Models API (free with Copilot Pro) |
+| `MSR_OPENAI_API_KEY` | _(unset)_ | OpenAI-compatible API key (overrides GITHUB_TOKEN) |
 | `MSR_OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
 | `MSR_OPENAI_MODEL` | `gpt-4o-mini` | Chat model |
 | `MSR_EMBED_MODEL` | `text-embedding-3-small` | Embedding model |
 | `MSR_DOCS_DIR` | `./docs` | Reference documents directory |
 | `MSR_KB_DIR` | `./kb_store` | Persistent knowledge-base directory |
-| `MSR_ARCHIVE_REPO` | `pranavkantgaur/msr-archive` | GitHub owner/repo for static source |
-| `MSR_ARCHIVE_BRANCH` | `master` | Branch of the archive repo |
-| `MSR_ARCHIVE_MAX_DOCS` | `0` (unlimited) | Max OCR files per archive run |
-| `MSR_OPENALEX_MAX_RESULTS` | `100` | Max OpenAlex papers per run |
-| `MSR_OPENALEX_EMAIL` | _(unset)_ | Email for OpenAlex polite pool |
-| `MSR_GITHUB_TOKEN` | _(unset)_ | GitHub PAT for higher API rate limits |
-| `MSR_KB_S3_BUCKET` | _(unset)_ | S3 bucket for Lambda KB persistence |
-| `MSR_KB_S3_PREFIX` | `kb-prod/` | S3 key prefix inside the bucket |
-| `MSR_API_KEY` | _(unset)_ | Shared API key for Lambda HTTP auth |
-| `MSR_PLANT_DATA_URL` | _(unset)_ | External plant data REST API URL (SCADA/historian/DT) |
-| `MSR_USE_LOCAL_GPU` | `false` | `true` to use local GPU models |
-| `MSR_LOCAL_EMBED_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Local embedding model |
-| `MSR_LOCAL_LLM_MODEL` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | Local generation model |
-| `MSR_HF_CACHE_DIR` | `/tmp/hf_cache` | HuggingFace model cache directory |
+| `MSR_PLANT_DATA_URL` | _(unset)_ | External plant data REST API URL |
+| `MSR_USE_LOCAL_GPU` | `false` | `true` to use local GPU (sentence-transformers) |
+| `MSR_ARXIV_MAX_RESULTS` | `100` | Max arXiv papers per run |
+| `MSR_S2_API_KEY` | _(unset)_ | Semantic Scholar API key (100 req/s vs 1 req/s) |
+| `MSR_S2_MAX_RESULTS` | `100` | Max S2 papers per run |
+| `MSR_API_KEY` | _(unset)_ | Shared secret for HTTP endpoint auth (`X-Api-Key` header) |
+| `MSR_SERVER_HOST` | `0.0.0.0` | `server.py` bind address |
+| `MSR_SERVER_PORT` | `8000` | `server.py` TCP port |
 
----
+In GitHub Codespaces, `GITHUB_TOKEN` is injected automatically and forwarded
+to `MSR_GITHUB_TOKEN` by both the devcontainer config and `server.py`.
 
 ## Integrating with MSR Digital Twin Architectures
 

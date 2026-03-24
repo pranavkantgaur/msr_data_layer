@@ -49,30 +49,36 @@ LLM_MODEL       ?= TinyLlama/TinyLlama-1.1B-Chat-v1.0
 .PHONY: help
 help:
 	@echo ""
-	@echo "MSR Knowledge Base Service – make targets"
-	@echo "========================================="
+	@echo "MSR Data Layer – make targets"
+	@echo "============================="
 	@echo ""
+	@echo "─── Primary: GitHub Codespaces / local ──────────────────────────────"
+	@echo "  make serve              Start HTTP server on port 8000 (server.py)"
+	@echo "                          In Codespaces the URL is auto-published."
+	@echo "  make serve-mcp          Start stdio MCP server (for AI agents)"
+	@echo "  make health             GET  http://127.0.0.1:8000/health"
+	@echo "  make query              POST http://127.0.0.1:8000/query (test query)"
+	@echo "  make test               Run all unit tests"
+	@echo ""
+	@echo "─── Advanced: AWS Lambda deployment (optional) ──────────────────────"
 	@echo "  make build              Build Lambda deployment package (Docker)"
 	@echo "  make build-native       Build without Docker (uses current Python)"
 	@echo "  make deploy-guided      First-time interactive deploy"
 	@echo "  make deploy             Deploy using saved samconfig.toml"
 	@echo "  make delete             Delete the CloudFormation stack"
-	@echo ""
-	@echo "  make local-api          Start local HTTP server (port 3000)"
+	@echo "  make local-api          Start SAM local HTTP server (port 3000)"
 	@echo "  make local-health       GET  http://127.0.0.1:3000/health"
 	@echo "  make local-query        POST http://127.0.0.1:3000/query"
 	@echo "  make local-update       POST http://127.0.0.1:3000/kb/update"
+	@echo "  make logs               Tail Lambda CloudWatch logs"
+	@echo "  make outputs            Show CloudFormation stack outputs (API URL)"
 	@echo ""
-	@echo "GPU container targets (sentence-transformers + HuggingFace LLM):"
+	@echo "─── Advanced: GPU container (optional) ─────────────────────────────"
 	@echo "  make build-gpu-container  Build GPU Docker image (Dockerfile.gpu)"
 	@echo "  make run-gpu-local        Run GPU container locally (CPU fallback)"
 	@echo "  make run-gpu-cuda         Run GPU container with NVIDIA GPU"
 	@echo "  make push-gpu-container   Push GPU image to ECR"
 	@echo "  make deploy-gpu           Deploy GPU Lambda variant via SAM"
-	@echo ""
-	@echo "  make test               Run all unit tests"
-	@echo "  make logs               Tail Lambda CloudWatch logs"
-	@echo "  make outputs            Show CloudFormation stack outputs (API URL etc.)"
 	@echo ""
 	@echo "Configuration:"
 	@echo "  STACK_NAME=$(STACK_NAME)"
@@ -82,12 +88,6 @@ help:
 	@echo "  EMBED_MODEL=$(EMBED_MODEL)"
 	@echo "  LLM_MODEL=$(LLM_MODEL)"
 	@echo ""
-	@echo ""
-	@echo "  make test           Run unit tests"
-	@echo "  make logs           Tail Lambda CloudWatch logs"
-	@echo "  make outputs        Show CloudFormation stack outputs (API URL etc.)"
-	@echo ""
-	@echo "Configuration:"
 	@echo "  STACK_NAME=$(STACK_NAME)"
 	@echo "  REGION=$(REGION)"
 	@echo "  ENVIRONMENT=$(ENVIRONMENT)"
@@ -160,7 +160,32 @@ outputs:
 		--output table
 
 # ---------------------------------------------------------------------------
-# Local development (requires sam local)
+# Primary targets – GitHub Codespaces / local server (no AWS required)
+# ---------------------------------------------------------------------------
+
+.PHONY: serve
+serve:
+	python server.py --host 0.0.0.0 --port $(MSR_SERVER_PORT)
+
+MSR_SERVER_PORT ?= 8000
+
+.PHONY: serve-mcp
+serve-mcp:
+	python msr_mcp_server_main.py
+
+.PHONY: health
+health:
+	curl -s http://127.0.0.1:$(MSR_SERVER_PORT)/health | python3 -m json.tool
+
+.PHONY: query
+query:
+	curl -s -X POST http://127.0.0.1:$(MSR_SERVER_PORT)/query \
+		-H "Content-Type: application/json" \
+		-d '{"question": "What is the thermal efficiency of the TMSR-LF1 reactor?"}' \
+		| python3 -m json.tool
+
+# ---------------------------------------------------------------------------
+# Local development (requires sam local – optional, AWS path)
 # ---------------------------------------------------------------------------
 
 .PHONY: local-api

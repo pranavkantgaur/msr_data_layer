@@ -1,40 +1,66 @@
 """
-MSR Data Layer – Standalone HTTP Server for GitHub Codespaces Deployment
+MSR Data Layer – Standalone HTTP Server (Primary Deployment)
 
-Wraps ``lambda_function.lambda_handler`` as a plain HTTP server so the MSR
-data layer can run inside GitHub Codespaces (or any host) without AWS
-infrastructure.
+This is the **primary HTTP server** for the MSR Data Layer.  It wraps
+``lambda_function.lambda_handler`` as a plain HTTP server so the service
+can run inside GitHub Codespaces (or any host) without AWS infrastructure.
 
-Deployment via GitHub Codespaces
----------------------------------
+Architecture overview
+---------------------
+The MSR Data Layer exposes two independent interfaces:
+
+1. **This HTTP server** (``server.py``) – for human operators, demo notebooks,
+   and any client that speaks plain HTTP.  Start with ``python server.py`` or
+   ``make serve``.  In a GitHub Codespace the port is automatically made public
+   so you get a shareable ``https://<codespace>-8000.app.github.dev`` URL.
+
+2. **stdio MCP server** (``msr_mcp_server_main.py``) – for AI agents such as
+   GitHub Copilot Chat, Claude, and custom MCP-compatible agents.  Start with
+   ``python msr_mcp_server_main.py``.  No port needed; communication is over
+   stdin/stdout.
+
+Both interfaces share the same underlying KB and timeseries store.
+
+Primary deployment: GitHub Codespaces
+--------------------------------------
 1. Open the repository in a GitHub Codespace.
-2. The ``.devcontainer/devcontainer.json`` configuration installs dependencies
-   and starts this server automatically on port 8000.
-3. In the *Ports* panel of VS Code, right-click port 8000 and select
-   **"Make Public"** to expose the service on a public HTTPS URL such as
-   ``https://<codespace-name>-8000.preview.app.github.dev``.
-4. Use that public URL as the base URL for any client.
+2. The ``.devcontainer/devcontainer.json`` installs dependencies and starts
+   this server automatically on port 8000 with *public* visibility.
+3. The public URL (e.g. ``https://<codespace-name>-8000.app.github.dev``) is
+   printed in the Codespace's *Ports* panel and in ``/tmp/msr_server.log``.
+4. Paste that URL into the demo notebook or share it with reviewers.
 
-The ``GITHUB_TOKEN`` secret injected automatically by Codespaces is forwarded
-to the RAG pipeline as ``MSR_GITHUB_TOKEN``, enabling GitHub Models API
-(gpt-4o-mini / text-embedding-3-small) for free with a Copilot Pro subscription.
+The ``GITHUB_TOKEN`` injected automatically by Codespaces is forwarded to
+the RAG pipeline as ``MSR_GITHUB_TOKEN``, enabling GitHub Models API
+(gpt-4o-mini / text-embedding-3-small) **at no extra cost** with a Copilot
+Pro subscription.
 
-Usage
------
+Local usage
+-----------
     python server.py                    # default: 0.0.0.0:8000
     python server.py --port 9000        # custom port
     python server.py --host 127.0.0.1   # localhost only
+
+    # or via Makefile:
+    make serve                          # same as python server.py
 
 All environment variables understood by ``lambda_function.py`` are respected
 (``MSR_GITHUB_TOKEN``, ``MSR_API_KEY``, ``MSR_PLANT_DATA_URL``, etc.).
 
 Endpoints
 ---------
-GET  /health          – liveness check
-POST /mcp             – JSON-RPC 2.0 / MCP protocol
-POST /query           – plain-text RAG query
-POST /kb/update       – trigger KB ingestion (archive + OpenAlex)
-POST /data/ingest     – push plant operational data into the KB
+GET  /health                – liveness check
+POST /mcp                   – JSON-RPC 2.0 / MCP protocol
+POST /query                 – plain-text RAG query
+POST /kb/update             – trigger KB ingestion (archive + OpenAlex + arXiv + S2)
+POST /data/ingest           – push plant operational data (text/event logs)
+POST /timeseries/ingest     – push timestamped sensor readings (structured)
+POST /timeseries/query      – query sensor timeseries (structured or natural language)
+
+Optional: AWS deployment
+------------------------
+``lambda_function.py`` also serves as an AWS Lambda handler for those who
+need cloud-hosted deployment.  See ``template.yaml`` and ``make deploy-guided``.
 """
 
 from __future__ import annotations
@@ -200,7 +226,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     logger.info(
         "Endpoints: GET /health  POST /mcp  POST /query  "
-        "POST /kb/update  POST /data/ingest"
+        "POST /kb/update  POST /data/ingest  "
+        "POST /timeseries/ingest  POST /timeseries/query"
     )
     try:
         server.serve_forever()

@@ -21,13 +21,16 @@ Chinese TMSR-LF1 or the historic ORNL MSRE.
 
 | Category | Details |
 |---|---|
-| **Knowledge retrieval** | Multi-step RAG over ORNL MSR archive, OpenAlex papers, and plant-specific documents |
+| **Knowledge retrieval** | Multi-step RAG over ORNL MSR archive (full text), OpenAlex/arXiv/S2 paper abstracts (auto-fetched), and user-provided full-text papers (via `ingest_full_paper_text`) |
+| **Abstract vs full text** | Auto-fetched papers are marked `[ABSTRACT ONLY]`. Users explicitly request full-text ingestion; the full text is stored under `full:<source_id>` alongside the abstract |
 | **Live data reading** | MCP tools that read current plant sensor state from an external SCADA/historian REST API (or a development stub) |
-| **Data ingestion** | `ingest_plant_data` MCP tool + Lambda endpoint (`POST /data/ingest`) for pushing sensor snapshots, event logs, and maintenance reports into the KB |
-| **Timeseries storage & query** | `TimeseriesStore` (SQLite `sqlite3` stdlib) for structured plant sensor timeseries; MCP tools `query_sensor_timeseries`, `get_sensor_stats`, `query_plant_data_nl` (NL→SQL); Lambda endpoints `POST /timeseries/ingest` and `POST /timeseries/query` |
-| **Physical AI training data** | Use cases in `use_cases/physical_ai/` documenting how the data layer feeds foundation-model training for 12 robotic operational areas |
-| **MCP server** | stdio and HTTP transports; deployable as AWS Lambda + API Gateway or as a local process |
-| **GPU acceleration** | Optional local GPU embedding/generation via sentence-transformers + HuggingFace Transformers |
+| **Data ingestion** | `ingest_plant_data` MCP tool + HTTP endpoint (`POST /data/ingest`) for pushing sensor snapshots, event logs, and maintenance reports into the KB |
+| **Full-text upgrade** | `ingest_full_paper_text` MCP tool + HTTP endpoint for upgrading abstract-only KB entries to full text |
+| **Timeseries storage & query** | `TimeseriesStore` (SQLite `sqlite3` stdlib) for structured plant sensor timeseries; MCP tools `query_sensor_timeseries`, `get_sensor_stats`, `query_plant_data_nl` (NL→SQL); HTTP endpoints `POST /timeseries/ingest` and `POST /timeseries/query` |
+| **Primary deployment** | GitHub Codespaces via `server.py` (`make serve`); `GITHUB_TOKEN` auto-forwarded for free GitHub Models API access |
+| **MCP server** | stdio transport (`msr_mcp_server_main.py`, `make serve-mcp`) for AI agents; HTTP transport via `server.py` for human operators and notebooks |
+| **Optional: AWS Lambda** | `lambda_function.py` + `template.yaml` for cloud deployment (not required for local/Codespace use) |
+| **Optional: GPU acceleration** | Local GPU embedding/generation via sentence-transformers + HuggingFace Transformers (`Dockerfile.gpu`) |
 
 ---
 

@@ -24,13 +24,13 @@ flowchart TD
     %% ── Knowledge-base loaders ────────────────────────────────────────────
     subgraph KBS["msr_kb_sources.py — Source Loaders"]
         direction TB
-        AL["MSRArchiveLoader\nfetches OCR files via\nGitHub Contents API\nstate: archive_state.json"]
-        OAL["OpenAlexLoader\nfetches academic papers\ndeduplication + state\nstate: openalex_state.json"]
-        AXL["ArXivLoader\nfetches Atom XML\ndeduplication + state\nstate: arxiv_state.json"]
-        S2L["SemanticScholarLoader\nfetches paper metadata\ndeduplication + state\nstate: semanticscholar_state.json"]
+        AL["MSRArchiveLoader\nfetches OCR files via\nGitHub Contents API\nFULL TEXT ingested\nstate: archive_state.json"]
+        OAL["OpenAlexLoader\nfetches ABSTRACTS ONLY\n[ABSTRACT ONLY] prefix\ndeduplication + state\nstate: openalex_state.json"]
+        AXL["ArXivLoader\nfetches ABSTRACTS ONLY\n[ABSTRACT ONLY] prefix\ndeduplication + state\nstate: arxiv_state.json"]
+        S2L["SemanticScholarLoader\nfetches ABSTRACTS ONLY\n[ABSTRACT ONLY] prefix\ndeduplication + state\nstate: semanticscholar_state.json"]
         PDL["PlantDataLoader\naccepts operator/agent pushes\nsensor snapshots, event logs\nstate: plant_data_state.json"]
         TSS["TimeseriesStore\nSQLite sqlite3 stdlib\nplant_timeseries.db\ntime-range / aggregate / NL→SQL\nstate: timeseries_state.json"]
-        KBM["KBSourceManager\nupdate_all() orchestrates\nall four text loaders\ningest_timeseries() / query_timeseries()\nquery_timeseries_nl() NL→SQL"]
+        KBM["KBSourceManager\nupdate_all() orchestrates\nall text loaders\ningest_timeseries() / query_timeseries()\nquery_timeseries_nl() NL→SQL\ningest_full_paper_text() full-text upgrade\nlist_abstract_only_sources()"]
     end
 
     ORNL -->|HTTPS fetch| AL
@@ -64,7 +64,7 @@ flowchart TD
         direction LR
         READ["Read tools\n• get_reactor_status\n• get_sensor_reading\n• get_all_sensor_readings\n• get_sensor_history\n• get_active_alarms\n• get_data_source_info"]
         TSTOOLS["Timeseries tools\n• query_sensor_timeseries\n• get_sensor_stats\n• query_plant_data_nl (NL→SQL)"]
-        WRITE["Write tool\n• ingest_plant_data\n  → PlantDataLoader\n    → RAG pipeline"]
+        WRITE["Write tools\n• ingest_plant_data\n  → PlantDataLoader → RAG\n• ingest_full_paper_text\n  → full:<source_id> in RAG"]
     end
 
     SCADA -->|"GET MSR_PLANT_DATA_URL (or dev stub)"| READ
@@ -74,15 +74,17 @@ flowchart TD
 
     %% ── Transport / deployment variants ───────────────────────────────────
     subgraph TRANS["Transport Variants"]
-        STDIO["msr_mcp_server_main.py\nstdio transport\nfor local agents /\nClaude Desktop / Copilot"]
-        LAMBDA["lambda_function.py\nHTTP transport (AWS)\nAPI Gateway + Lambda\nPOST /mcp\nPOST /query\nPOST /kb/update\nPOST /data/ingest\nPOST /timeseries/ingest\nPOST /timeseries/query\nGET  /health"]
+        STDIO["msr_mcp_server_main.py\nstdio transport\nfor AI agents:\nGitHub Copilot Chat\nClaude Desktop\nCustom MCP clients\nmake serve-mcp"]
+        HTTP["server.py (primary)\nHTTP :8000\nGitHub Codespaces (free)\nmake serve\nfull endpoints:\nPOST /mcp /query /kb/update\nPOST /data/ingest\nPOST /timeseries/ingest\nPOST /timeseries/query\nGET  /health"]
+        LAMBDA["lambda_function.py\n(optional AWS path)\nAPI Gateway + Lambda\nsame endpoints as server.py"]
     end
 
     MCP --> STDIO
+    MCP --> HTTP
     MCP --> LAMBDA
 
     %% ── AWS infrastructure ────────────────────────────────────────────────
-    subgraph AWS["AWS Infrastructure (template.yaml)"]
+    subgraph AWS["AWS Infrastructure (template.yaml) — Optional"]
         APIGW["API Gateway\nHTTP API v2\nCORS enabled"]
         LFUNC["Lambda Function\nMSRKBFunction\npython3.12 / x86_64\n1 GB RAM, 15 min timeout\nX-Ray tracing"]
         S3["S3 Bucket\nKBStoreBucket\nVersioned + AES-256\nKB persistence across\nLambda cold starts"]
@@ -153,6 +155,8 @@ flowchart TD
 | Embedding | `msr_digital_twin_with_rag.py` | Text chunks | Dense float vectors (dim 256–1536) |
 | Insight extraction | `msr_digital_twin_with_rag.py` | Text chunks | LLM-generated summaries + topics |
 | KB persistence | `./kb_store/` JSON files | Chunks + embeddings + insights | On-disk vector store |
+| Abstract ingest (auto) | OpenAlex/arXiv/S2 loaders | Paper metadata | `[ABSTRACT ONLY]`-prefixed chunks → KB |
+| Full-text ingest (on request) | `KBSourceManager.ingest_full_paper_text` | Markdown text | `full:<source_id>` chunks → KB |
 | Plant data ingest (text) | `msr_kb_sources.py` `PlantDataLoader` | Sensor snapshots / event logs | Chunks → KB store |
 | Plant data ingest (timeseries) | `msr_kb_sources.py` `TimeseriesStore` | `{sensor_name, value, unit, timestamp}` rows | SQLite `plant_timeseries.db` |
 | Timeseries query (structured) | `TimeseriesStore.query_range/aggregate` | sensor name + optional time bounds | Rows / aggregate stats |
@@ -160,8 +164,8 @@ flowchart TD
 | Retrieval | `msr_digital_twin_with_rag.py` | Natural-language question | Ranked relevant chunks |
 | Synthesis | `msr_digital_twin_with_rag.py` | Ranked chunks + live plant state | Final answer text |
 | MCP tools | `msr_mcp_server.py` | Agent/operator requests | JSON tool responses |
-| HTTP transport | `lambda_function.py` | HTTP POST/GET | JSON responses |
+| HTTP transport (primary) | `server.py` wraps `lambda_function.py` | HTTP POST/GET on :8000 | JSON responses — Codespaces public URL |
+| HTTP transport (optional) | `lambda_function.py` on AWS Lambda | HTTP POST/GET via API Gateway | JSON responses |
 | stdio transport | `msr_mcp_server_main.py` | MCP JSON-RPC messages | MCP JSON-RPC responses |
-| S3 sync | `lambda_function.py` | `/tmp/kb_store/` files | S3 bucket objects |
 
 See the individual component diagrams for internals of each stage.

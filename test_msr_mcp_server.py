@@ -46,6 +46,7 @@ def test_tools_list():
         "query_sensor_timeseries",
         "get_sensor_stats",
         "query_plant_data_nl",
+        "ingest_full_paper_text",
     }
     assert expected == names
 
@@ -310,3 +311,43 @@ def test_query_plant_data_nl_no_llm(tmp_path, monkeypatch):
     # Should return error or empty rows — not raise
     assert "rows" in result
     assert isinstance(result["rows"], list)
+
+
+# ---------------------------------------------------------------------------
+# ingest_full_paper_text tool tests
+# ---------------------------------------------------------------------------
+
+def test_ingest_full_paper_text_empty_text(tmp_path, monkeypatch):
+    """ingest_full_paper_text returns error when text is empty."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    from msr_mcp_server import ingest_full_paper_text
+    result = ingest_full_paper_text("arxiv:2401.12345", "")
+    assert result["success"] is False
+    assert "empty" in result["error"].lower()
+
+
+def test_ingest_full_paper_text_empty_source_id(tmp_path, monkeypatch):
+    """ingest_full_paper_text returns error when source_id is empty."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    from msr_mcp_server import ingest_full_paper_text
+    result = ingest_full_paper_text("", "Full paper text here.")
+    assert result["success"] is False
+    assert "empty" in result["error"].lower()
+
+
+def test_ingest_full_paper_text_success(tmp_path, monkeypatch):
+    """ingest_full_paper_text stores full text under full:<source_id>."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    monkeypatch.delenv("MSR_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)  # prevent GitHub Models API engine
+    from msr_mcp_server import ingest_full_paper_text
+    result = ingest_full_paper_text(
+        "arxiv:2401.12345",
+        "# Full paper text\n\nThis is the complete text of the paper about "
+        "molten salt reactors. The key finding is that FLiNaK is stable...",
+    )
+    assert result["success"] is True
+    assert result["source_id"] == "arxiv:2401.12345"
+    assert result["full_source_id"] == "full:arxiv:2401.12345"
+    assert result["chunks_added"] >= 1
