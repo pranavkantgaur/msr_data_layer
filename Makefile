@@ -331,7 +331,7 @@ deploy-gpu: build
 
 .PHONY: test
 test:
-	python -m pytest test_lambda_function.py test_msr_mcp_server.py test_msr_rag.py test_msr_kb_sources.py -v
+	python -m pytest test_lambda_function.py test_msr_mcp_server.py test_msr_rag.py test_msr_kb_sources.py test_generate_architecture_diagrams.py -v
 
 .PHONY: test-lambda
 test-lambda:
