@@ -18,6 +18,10 @@ structural changes.
 │                                                    │                │
 │  Live SCADA/historian ──► MSR_PLANT_DATA_URL ──────┼──────────────┐ │
 │  (or development stub)                             │              │ │
+│                                                    │              │ │
+│  Push sensor readings ──► PlantDataLoader ──► TimeseriesStore     │ │
+│  (operator / agent)        (ingest_text /      SQLite             │ │
+│                            ingest_timeseries)  plant_timeseries.db│ │
 └─────────────────────────────────────────────────────────────────────┘
                                                      │              │
                                   ┌──────────────────▼──────────────▼─┐
@@ -45,6 +49,11 @@ structural changes.
                                │   get_active_alarms               │
                                │   get_data_source_info            │
                                │                                   │
+                               │  Timeseries tools (SQLite):       │
+                               │   query_sensor_timeseries         │
+                               │   get_sensor_stats                │
+                               │   query_plant_data_nl (NL→SQL)    │
+                               │                                   │
                                │  Write tools:                     │
                                │   ingest_plant_data               │
                                └───────┬───────────────┬───────────┘
@@ -52,9 +61,9 @@ structural changes.
                   ┌────────────────────▼──┐   ┌────────▼────────────────┐
                   │  msr_mcp_server_main  │   │   lambda_function.py   │
                   │  (stdio transport)    │   │   (HTTP + EventBridge  │
-                  │  for local agents /   │   │    + /data/ingest)     │
-                  │  Claude Desktop /     │   │   AWS Lambda +         │
-                  │  OpenClaw             │   │   API Gateway via SAM  │
+                  │  for local agents /   │   │    + /data/ingest      │
+                  │  Claude Desktop /     │   │    + /timeseries/ingest│
+                  │  OpenClaw             │   │    + /timeseries/query) │
                   └────────────────────┬─┘   └────────────────────────┘
                                        │
                   ┌────────────────────▼──────────────────────────────┐
@@ -87,11 +96,16 @@ The intelligence layer. Implements:
   and source insights
 
 ### `msr_kb_sources.py`
-Document loaders that populate the KB:
+Document loaders and data stores that populate the KB:
 - `MSRArchiveLoader` — fetches and parses ORNL MSR technical reports
 - `OpenAlexLoader` — fetches academic papers via the OpenAlex API
 - `PlantDataLoader` — ingests real-time plant operational data snapshots;
   state persisted in `plant_data_state.json`
+- `TimeseriesStore` — **SQLite-backed timeseries store** (`sqlite3` stdlib);
+  append-only table `sensor_readings(id, timestamp, sensor_name, value, unit, source_id, data_type, inserted_at)`;
+  supports time-range queries, aggregate statistics, and NL→SQL via
+  `execute_safe_select()` + `get_schema_description()`;
+  state persisted in `timeseries_state.json`
 
 ### `lambda_function.py`
 AWS Lambda entry point. Routes HTTP requests to:
@@ -99,7 +113,8 @@ AWS Lambda entry point. Routes HTTP requests to:
 - `POST /query` → RAG query
 - `POST /kb/update` → KB refresh
 - `POST /data/ingest` → plant data ingest (calls `PlantDataLoader`)
-- `POST /data/query` → structured plant data query
+- `POST /timeseries/ingest` → ingest timestamped sensor readings into `TimeseriesStore`
+- `POST /timeseries/query` → structured or NL query against `TimeseriesStore`
 
 ### `msr_digital_twin_client.py`
 Python client that wraps the MCP server tools as Python methods. Used for

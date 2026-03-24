@@ -63,7 +63,25 @@ flowchart TD
             P1 & P2 --> P3 --> P4 --> P5
         end
 
+        subgraph TSS["TimeseriesStore — SQLite timeseries (sqlite3 stdlib)"]
+            T1["insert_readings(readings, source_id)\nBatch-insert {sensor_name, value,\nunit, timestamp} rows\nDedup by source_id"]
+            T2["query_range(sensor, start, end)\nquery_latest(sensor, last_n)\nquery_aggregate(sensor, avg/min/max/count)"]
+            T3["execute_safe_select(sql)\nValidates SELECT-only (safety)\nUsed by NL→SQL path"]
+            T4["get_schema_description()\nSchema + known sensors\n→ LLM prompt context"]
+            T5[("plant_timeseries.db\nSQLite\nsensor_readings table\nIndexed by sensor+timestamp")]
+            T1 --> T5
+            T2 & T3 --> T5
+            T4 -.->|feeds NL→SQL LLM prompt| T3
+        end
+
+        subgraph MGR["KBSourceManager — timeseries orchestration"]
+            M1["ingest_timeseries(readings, source_id)\n→ TimeseriesStore.insert_readings()\n+ optional PlantDataLoader text summary"]
+            M2["query_timeseries(sensor, start, end, agg)\n→ TimeseriesStore.query_range/aggregate()"]
+            M3["query_timeseries_nl(question)\nNL → LLM generates SQL\n→ execute_safe_select(sql)"]
+        end
+
         KBM --> ARCH & OAL & AXL & S2L
+        KBM --> MGR
     end
 
     %% External targets
@@ -72,6 +90,7 @@ flowchart TD
     EXT_AX["export.arxiv.org\n(public, ToS: ≥3 s)"]
     EXT_S2["api.semanticscholar.org\n(public/authenticated)"]
     OPS["Operators / agents\n(POST /data/ingest)"]
+    TSOPS["Operators / agents\n(POST /timeseries/ingest)"]
 
     RAG["rag.add_document()\nmsr_digital_twin_with_rag.py"]
 
@@ -80,14 +99,17 @@ flowchart TD
     EXT_AX   -->|XML| AXL
     EXT_S2   -->|REST| S2L
     OPS      -->|push| PDL
+    TSOPS    -->|insert_readings()| TSS
 
     A5 & O6 & AX7 & S6 & P5 --> RAG
 
     classDef loader fill:#e8f8e8,stroke:#4caf50,color:#000
     classDef ext    fill:#e8f4f8,stroke:#2196f3,color:#000
     classDef rag    fill:#fff8e1,stroke:#ff9800,color:#000
+    classDef ts     fill:#e8f0fe,stroke:#5c6bc0,color:#000
     class ARCH,OAL,AXL,S2L,PDL loader
-    class EXT_ORNL,EXT_OA,EXT_AX,EXT_S2,OPS ext
+    class TSS,MGR ts
+    class EXT_ORNL,EXT_OA,EXT_AX,EXT_S2,OPS,TSOPS ext
     class RAG rag
 ```
 
@@ -146,6 +168,35 @@ python msr_kb_sources.py --ingest-plant-data \
     --content "Core temp 712°C at 14:32" \
     --data-type sensor_snapshot
     → PlantDataLoader: ingests one record from CLI
+```
+
+**Timeseries store (Python API — no CLI flag needed):**
+
+```python
+from msr_kb_sources import TimeseriesStore, KBSourceManager
+from msr_digital_twin_with_rag import MSRDigitalTwinRAG
+
+ts = TimeseriesStore()
+
+# Ingest timestamped readings
+ts.insert_readings(
+    [{"sensor_name": "reactor_power_mw", "value": 99.5, "unit": "MW",
+      "timestamp": "2024-01-15T14:00:00Z"}],
+    source_id="scada-20240115T1400Z",
+)
+
+# Time-range query
+rows = ts.query_range("reactor_power_mw",
+                      start="2024-01-15T00:00:00Z",
+                      end="2024-01-15T23:59:59Z")
+
+# Aggregate statistics
+stats = ts.query_aggregate("reactor_power_mw", agg="avg")
+
+# NL→SQL (requires LLM backend)
+rag = MSRDigitalTwinRAG()
+mgr = KBSourceManager(rag)
+result = mgr.query_timeseries_nl("What was the max core temperature last week?")
 ```
 
 ---

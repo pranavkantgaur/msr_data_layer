@@ -18,6 +18,7 @@ flowchart TD
         AX["📄 arXiv Atom XML\nMSR + TMSR-LF1 preprints\n≥ 3 s between requests (ToS)"]
         S2["🔬 Semantic Scholar\nS2 Graph API\nOptional API key for 100 req/s"]
         SCADA["⚙️ Plant SCADA / Historian\nMSR_PLANT_DATA_URL\n(REST JSON; stub when unset)"]
+        PUSH["📊 Sensor push (operator/agent)\ntimestamped readings\n{sensor_name, value, unit, timestamp}"]
     end
 
     %% ── Knowledge-base loaders ────────────────────────────────────────────
@@ -28,13 +29,15 @@ flowchart TD
         AXL["ArXivLoader\nfetches Atom XML\ndeduplication + state\nstate: arxiv_state.json"]
         S2L["SemanticScholarLoader\nfetches paper metadata\ndeduplication + state\nstate: semanticscholar_state.json"]
         PDL["PlantDataLoader\naccepts operator/agent pushes\nsensor snapshots, event logs\nstate: plant_data_state.json"]
-        KBM["KBSourceManager\nupdate_all() orchestrates\nall four loaders"]
+        TSS["TimeseriesStore\nSQLite sqlite3 stdlib\nplant_timeseries.db\ntime-range / aggregate / NL→SQL\nstate: timeseries_state.json"]
+        KBM["KBSourceManager\nupdate_all() orchestrates\nall four text loaders\ningest_timeseries() / query_timeseries()\nquery_timeseries_nl() NL→SQL"]
     end
 
     ORNL -->|HTTPS fetch| AL
     OA   -->|REST/HTTPS| OAL
     AX   -->|Atom XML| AXL
     S2   -->|REST/HTTPS| S2L
+    PUSH -->|insert_readings()| TSS
     AL & OAL & AXL & S2L --> KBM
 
     %% ── RAG pipeline ──────────────────────────────────────────────────────
@@ -60,17 +63,19 @@ flowchart TD
     subgraph MCP["msr_mcp_server.py — MCP Tool Surface"]
         direction LR
         READ["Read tools\n• get_reactor_status\n• get_sensor_reading\n• get_all_sensor_readings\n• get_sensor_history\n• get_active_alarms\n• get_data_source_info"]
+        TSTOOLS["Timeseries tools\n• query_sensor_timeseries\n• get_sensor_stats\n• query_plant_data_nl (NL→SQL)"]
         WRITE["Write tool\n• ingest_plant_data\n  → PlantDataLoader\n    → RAG pipeline"]
     end
 
     SCADA -->|"GET MSR_PLANT_DATA_URL (or dev stub)"| READ
     SYNTH -->|"rag.answer()"| READ
+    TSS   -->|"query_range / aggregate / execute_safe_select"| TSTOOLS
     WRITE -->|calls| PDL
 
     %% ── Transport / deployment variants ───────────────────────────────────
     subgraph TRANS["Transport Variants"]
         STDIO["msr_mcp_server_main.py\nstdio transport\nfor local agents /\nClaude Desktop / Copilot"]
-        LAMBDA["lambda_function.py\nHTTP transport (AWS)\nAPI Gateway + Lambda\nPOST /mcp\nPOST /query\nPOST /kb/update\nPOST /data/ingest\nGET  /health"]
+        LAMBDA["lambda_function.py\nHTTP transport (AWS)\nAPI Gateway + Lambda\nPOST /mcp\nPOST /query\nPOST /kb/update\nPOST /data/ingest\nPOST /timeseries/ingest\nPOST /timeseries/query\nGET  /health"]
     end
 
     MCP --> STDIO
@@ -148,7 +153,10 @@ flowchart TD
 | Embedding | `msr_digital_twin_with_rag.py` | Text chunks | Dense float vectors (dim 256–1536) |
 | Insight extraction | `msr_digital_twin_with_rag.py` | Text chunks | LLM-generated summaries + topics |
 | KB persistence | `./kb_store/` JSON files | Chunks + embeddings + insights | On-disk vector store |
-| Plant data ingest | `msr_kb_sources.py` `PlantDataLoader` | Sensor snapshots / event logs | Chunks → KB store |
+| Plant data ingest (text) | `msr_kb_sources.py` `PlantDataLoader` | Sensor snapshots / event logs | Chunks → KB store |
+| Plant data ingest (timeseries) | `msr_kb_sources.py` `TimeseriesStore` | `{sensor_name, value, unit, timestamp}` rows | SQLite `plant_timeseries.db` |
+| Timeseries query (structured) | `TimeseriesStore.query_range/aggregate` | sensor name + optional time bounds | Rows / aggregate stats |
+| Timeseries query (NL→SQL) | `KBSourceManager.query_timeseries_nl` | Natural-language question | LLM-generated SQL → executed rows |
 | Retrieval | `msr_digital_twin_with_rag.py` | Natural-language question | Ranked relevant chunks |
 | Synthesis | `msr_digital_twin_with_rag.py` | Ranked chunks + live plant state | Final answer text |
 | MCP tools | `msr_mcp_server.py` | Agent/operator requests | JSON tool responses |
