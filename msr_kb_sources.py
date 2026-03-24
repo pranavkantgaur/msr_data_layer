@@ -30,6 +30,13 @@ Five document sources feed the MSR data layer knowledge base:
    the knowledge base to accumulate operational history so future RAG queries
    can incorporate real plant experience alongside reference documents.
 
+6. **Plant timeseries store** – :class:`TimeseriesStore`
+   SQLite-backed (``sqlite3`` stdlib) append-only store for timestamped
+   sensor readings.  Enables time-range queries, aggregate statistics, and
+   natural-language-to-SQL queries over structured plant timeseries data.
+   Complements the text-centric RAG pipeline for numerical/temporal queries
+   that require precise aggregation rather than semantic similarity search.
+
 All loaders maintain a JSON state file in ``MSR_KB_DIR`` (default
 ``./kb_store``) so that documents already ingested are never processed
 twice.  Re-running the updater therefore only adds truly new content.
@@ -89,6 +96,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import sys
 import textwrap
 import time
@@ -1349,6 +1357,398 @@ class PlantDataLoader:
 
 
 # ---------------------------------------------------------------------------
+# TimeseriesStore – SQLite-backed plant sensor timeseries
+# ---------------------------------------------------------------------------
+
+class TimeseriesStore:
+    """
+    SQLite-backed append-only store for timestamped plant sensor readings.
+
+    Designed to complement the text-centric RAG pipeline by providing
+    precise time-range queries, aggregate statistics, and
+    natural-language-to-SQL query capability over structured numerical
+    plant data (SCADA readings, BEAVRS-style benchmark datasets, etc.).
+
+    Data is stored in a local SQLite database file
+    (``plant_timeseries.db`` inside ``MSR_KB_DIR``) using only the
+    Python standard library ``sqlite3`` module — no new dependencies.
+
+    The store is **append-only**: readings are never modified after
+    insertion, preserving the auditability requirement from
+    ``requirements.md``.
+
+    Schema
+    ------
+    Table ``sensor_readings``::
+
+        id          INTEGER PRIMARY KEY AUTOINCREMENT
+        timestamp   TEXT NOT NULL   -- ISO 8601 UTC string
+        sensor_name TEXT NOT NULL
+        value       REAL            -- numeric sensor value
+        unit        TEXT            -- physical unit (e.g. 'MW', '°C')
+        source_id   TEXT NOT NULL   -- provenance identifier
+        data_type   TEXT            -- category (sensor_snapshot, …)
+        inserted_at TEXT NOT NULL   -- wall-clock insert time
+
+    Indexes on ``(sensor_name, timestamp)`` and ``source_id`` support
+    efficient range and provenance queries.
+
+    Parameters
+    ----------
+    kb_dir : str | Path | None
+        Directory where the SQLite database is stored.
+        Defaults to the ``MSR_KB_DIR`` env var or ``./kb_store``.
+
+    Example
+    -------
+    ::
+
+        from msr_kb_sources import TimeseriesStore
+
+        ts = TimeseriesStore()
+
+        # Ingest two readings
+        ts.insert_readings(
+            [
+                {"timestamp": "2024-01-15T14:00:00Z",
+                 "sensor_name": "reactor_power_mw", "value": 99.8, "unit": "MW"},
+                {"timestamp": "2024-01-15T14:00:00Z",
+                 "sensor_name": "core_temperature_c", "value": 702.1, "unit": "°C"},
+            ],
+            source_id="snapshot-20240115T1400Z",
+        )
+
+        # Range query
+        rows = ts.query_range("reactor_power_mw",
+                              start="2024-01-15T00:00:00Z",
+                              end="2024-01-15T23:59:59Z")
+
+        # Aggregate
+        stats = ts.query_aggregate("reactor_power_mw", agg="avg")
+        print(stats["result"])   # e.g. 99.6
+    """
+
+    DB_FILE = "plant_timeseries.db"
+    STATE_FILE = "timeseries_state.json"
+
+    _CREATE_DDL = """
+        CREATE TABLE IF NOT EXISTS sensor_readings (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT    NOT NULL,
+            sensor_name TEXT    NOT NULL,
+            value       REAL,
+            unit        TEXT    DEFAULT '',
+            source_id   TEXT    NOT NULL,
+            data_type   TEXT    DEFAULT 'sensor_snapshot',
+            inserted_at TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ts_sensor_time
+            ON sensor_readings (sensor_name, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_ts_source
+            ON sensor_readings (source_id);
+    """
+
+    def __init__(self, kb_dir: str | Path | None = None) -> None:
+        self._kb_dir = Path(kb_dir or os.environ.get("MSR_KB_DIR", "./kb_store"))
+        self._kb_dir.mkdir(parents=True, exist_ok=True)
+        self._db_path = self._kb_dir / self.DB_FILE
+        self._state_path = self._kb_dir / self.STATE_FILE
+        self._init_db()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open and return a new SQLite connection with Row factory."""
+        conn = sqlite3.connect(str(self._db_path))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        conn = self._connect()
+        try:
+            conn.executescript(self._CREATE_DDL)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _count_readings(self) -> int:
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM sensor_readings").fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Public API — write
+    # ------------------------------------------------------------------
+
+    def source_id_exists(self, source_id: str) -> bool:
+        """Return ``True`` if readings from this *source_id* have already been inserted."""
+        state = _load_state(self._state_path)
+        return source_id in set(state.get("source_ids", []))
+
+    def insert_readings(
+        self,
+        readings: list[dict[str, Any]],
+        source_id: str,
+        data_type: str = "sensor_snapshot",
+    ) -> int:
+        """
+        Insert a batch of timestamped sensor readings.
+
+        Each reading must be a dict with at least ``sensor_name`` (or
+        ``sensor``) and ``value`` keys.  ``timestamp`` and ``unit`` are
+        optional.
+
+        Duplicate *source_id* inserts are **skipped** (idempotent) to
+        match the deduplication contract of the other loaders.
+
+        Parameters
+        ----------
+        readings : list[dict]
+            List of ``{sensor_name, value, unit, timestamp}`` dicts.
+        source_id : str
+            Unique provenance identifier for this batch.
+        data_type : str
+            Category label (default ``"sensor_snapshot"``).
+
+        Returns
+        -------
+        int
+            Number of rows inserted (0 if already seen).
+        """
+        if self.source_id_exists(source_id):
+            return 0
+        if not readings:
+            return 0
+
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        rows = []
+        for r in readings:
+            if not isinstance(r, dict):
+                continue
+            rows.append((
+                r.get("timestamp", now),
+                r.get("sensor_name", r.get("sensor", "")),
+                r.get("value"),
+                r.get("unit", ""),
+                source_id,
+                data_type,
+                now,
+            ))
+
+        conn = self._connect()
+        try:
+            conn.executemany(
+                "INSERT INTO sensor_readings "
+                "(timestamp, sensor_name, value, unit, source_id, data_type, inserted_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Update state
+        state = _load_state(self._state_path)
+        ids: set[str] = set(state.get("source_ids", []))
+        ids.add(source_id)
+        state["source_ids"] = sorted(ids)
+        state["total_readings"] = self._count_readings()
+        state["last_insert"] = now
+        _save_state(self._state_path, state)
+
+        print(f"[Timeseries] + {source_id} ({len(rows)} readings, data_type={data_type})")
+        return len(rows)
+
+    # ------------------------------------------------------------------
+    # Public API — read
+    # ------------------------------------------------------------------
+
+    def query_range(
+        self,
+        sensor_name: str,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """
+        Return readings for *sensor_name* within an optional time range.
+
+        Parameters
+        ----------
+        sensor_name : str
+            Exact sensor name (e.g. ``"reactor_power_mw"``).
+        start : str | None
+            ISO 8601 lower bound (inclusive).  No lower bound if ``None``.
+        end : str | None
+            ISO 8601 upper bound (inclusive).  No upper bound if ``None``.
+        limit : int
+            Maximum number of rows returned (default 1 000).
+
+        Returns
+        -------
+        list[dict]
+            Rows with keys ``timestamp``, ``sensor_name``, ``value``,
+            ``unit``, ``source_id``.
+        """
+        sql = (
+            "SELECT timestamp, sensor_name, value, unit, source_id "
+            "FROM sensor_readings WHERE sensor_name = ?"
+        )
+        params: list[Any] = [sensor_name]
+        if start:
+            sql += " AND timestamp >= ?"
+            params.append(start)
+        if end:
+            sql += " AND timestamp <= ?"
+            params.append(end)
+        sql += " ORDER BY timestamp ASC LIMIT ?"
+        params.append(limit)
+
+        conn = self._connect()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def query_latest(self, sensor_name: str, last_n: int = 10) -> list[dict[str, Any]]:
+        """Return the *last_n* readings for *sensor_name*, newest first."""
+        sql = (
+            "SELECT timestamp, sensor_name, value, unit, source_id "
+            "FROM sensor_readings WHERE sensor_name = ? "
+            "ORDER BY timestamp DESC LIMIT ?"
+        )
+        conn = self._connect()
+        try:
+            rows = conn.execute(sql, [sensor_name, last_n]).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def query_aggregate(
+        self,
+        sensor_name: str,
+        agg: str = "avg",
+        start: str | None = None,
+        end: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Return aggregate statistics for *sensor_name*.
+
+        Parameters
+        ----------
+        agg : str
+            One of ``"avg"``, ``"min"``, ``"max"``, ``"count"``.
+
+        Returns
+        -------
+        dict
+            ``{sensor_name, aggregation, result, n}``
+        """
+        valid = {"avg": "AVG", "min": "MIN", "max": "MAX", "count": "COUNT"}
+        func = valid.get(agg, "AVG")
+        sql = (
+            f"SELECT {func}(value) AS result, COUNT(*) AS n "
+            "FROM sensor_readings WHERE sensor_name = ?"
+        )
+        params: list[Any] = [sensor_name]
+        if start:
+            sql += " AND timestamp >= ?"
+            params.append(start)
+        if end:
+            sql += " AND timestamp <= ?"
+            params.append(end)
+
+        conn = self._connect()
+        try:
+            row = conn.execute(sql, params).fetchone()
+            result = dict(row) if row else {}
+        finally:
+            conn.close()
+
+        return {
+            "sensor_name": sensor_name,
+            "aggregation": agg,
+            "result": result.get("result"),
+            "n": result.get("n", 0),
+        }
+
+    def list_sensors(self) -> list[str]:
+        """Return all distinct sensor names currently in the store."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT sensor_name FROM sensor_readings ORDER BY sensor_name"
+            ).fetchall()
+            return [r[0] for r in rows]
+        finally:
+            conn.close()
+
+    def get_schema_description(self) -> str:
+        """
+        Return a plain-text description of the schema for LLM-assisted
+        natural-language-to-SQL translation.
+        """
+        sensors = self.list_sensors()
+        sensor_list = ", ".join(sensors[:30]) if sensors else "(empty — no data ingested yet)"
+        return (
+            "Table: sensor_readings\n"
+            "Columns:\n"
+            "  id          INTEGER PRIMARY KEY\n"
+            "  timestamp   TEXT  (ISO 8601 UTC, e.g. '2024-01-15T14:00:00Z')\n"
+            "  sensor_name TEXT\n"
+            "  value       REAL\n"
+            "  unit        TEXT\n"
+            "  source_id   TEXT\n"
+            "  data_type   TEXT\n"
+            "  inserted_at TEXT\n"
+            f"Known sensor_name values: {sensor_list}\n"
+            "All timestamps are UTC ISO 8601 strings.\n"
+            "Only SELECT queries are permitted."
+        )
+
+    def execute_safe_select(self, sql: str) -> list[dict[str, Any]]:
+        """
+        Execute a SELECT query against the timeseries store and return rows.
+
+        Raises
+        ------
+        ValueError
+            If *sql* does not begin with ``SELECT`` (safety guard against
+            mutation queries).
+        """
+        # Strip optional leading whitespace / markdown fences
+        cleaned = sql.strip().lstrip("(").upper()
+        if not cleaned.startswith("SELECT"):
+            raise ValueError(
+                f"Only SELECT queries are allowed. Received: {sql[:80]!r}"
+            )
+        conn = self._connect()
+        try:
+            rows = conn.execute(sql).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def status(self) -> dict[str, Any]:
+        """Return a status summary dict."""
+        state = _load_state(self._state_path)
+        return {
+            "source": "Plant timeseries SQLite store",
+            "db_path": str(self._db_path),
+            "total_readings": self._count_readings(),
+            "sensors": self.list_sensors(),
+            "source_ids_count": len(state.get("source_ids", [])),
+            "last_insert": state.get("last_insert", "never"),
+        }
+
+
+# ---------------------------------------------------------------------------
 # KBSourceManager – orchestrates all loaders
 # ---------------------------------------------------------------------------
 
@@ -1389,6 +1789,7 @@ class KBSourceManager:
         self._arxiv = ArXivLoader(kb_dir=_kb)
         self._s2 = SemanticScholarLoader(kb_dir=_kb)
         self._plant = PlantDataLoader(kb_dir=_kb)
+        self._ts = TimeseriesStore(kb_dir=_kb)
 
     def update_archive(self, max_docs: int = 0) -> int:
         """Ingest new OCR files from msr-archive. Returns docs added."""
@@ -1418,6 +1819,164 @@ class KBSourceManager:
         Returns the number of KB chunks added (0 if already ingested).
         """
         return self._plant.ingest_text(self._rag, text, source_id, data_type=data_type)
+
+    def ingest_timeseries(
+        self,
+        readings: list[dict[str, Any]],
+        source_id: str,
+        data_type: str = "sensor_snapshot",
+        also_ingest_text: bool = True,
+    ) -> dict[str, int]:
+        """
+        Insert timestamped sensor readings into the timeseries store and
+        optionally also ingest a text summary into the RAG knowledge base.
+
+        Parameters
+        ----------
+        readings : list[dict]
+            List of ``{sensor_name, value, unit, timestamp}`` dicts.
+        source_id : str
+            Unique provenance identifier.  Duplicate calls are no-ops.
+        data_type : str
+            Category label (default ``"sensor_snapshot"``).
+        also_ingest_text : bool
+            When ``True`` (default), also format the readings as a
+            human-readable text block and ingest it into the RAG pipeline
+            so that semantic search queries can surface this data.
+
+        Returns
+        -------
+        dict
+            ``{"timeseries_rows": <n>, "rag_chunks": <n>}``
+        """
+        ts_rows = self._ts.insert_readings(readings, source_id, data_type=data_type)
+        rag_chunks = 0
+        if also_ingest_text and ts_rows > 0:
+            text = self._plant._format_snapshot(readings)  # type: ignore[attr-defined]
+            rag_chunks = self._plant.ingest_text(
+                self._rag, text, f"ts:{source_id}", data_type=data_type
+            )
+        return {"timeseries_rows": ts_rows, "rag_chunks": rag_chunks}
+
+    def query_timeseries(
+        self,
+        sensor_name: str,
+        start: str | None = None,
+        end: str | None = None,
+        last_n: int | None = None,
+        aggregation: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Query the timeseries store for a named sensor.
+
+        Parameters
+        ----------
+        sensor_name : str
+            Sensor to query (e.g. ``"reactor_power_mw"``).
+        start : str | None
+            ISO 8601 start bound (inclusive).
+        end : str | None
+            ISO 8601 end bound (inclusive).
+        last_n : int | None
+            If set, return the last *n* readings (ignores start/end).
+        aggregation : str | None
+            If set (``"avg"``, ``"min"``, ``"max"``, ``"count"``), return
+            aggregate statistics instead of raw rows.
+
+        Returns
+        -------
+        dict
+            ``{sensor_name, rows, aggregation}`` or aggregate result dict.
+        """
+        if aggregation:
+            return self._ts.query_aggregate(sensor_name, agg=aggregation, start=start, end=end)
+        if last_n is not None:
+            rows = self._ts.query_latest(sensor_name, last_n=last_n)
+        else:
+            rows = self._ts.query_range(sensor_name, start=start, end=end)
+        return {"sensor_name": sensor_name, "rows": rows, "count": len(rows)}
+
+    def query_timeseries_nl(self, question: str) -> dict[str, Any]:
+        """
+        Answer a natural-language question about timeseries plant data via
+        LLM-assisted SQL generation (NL→SQL).
+
+        The LLM generates a SQLite SELECT query from the *question* and the
+        table schema.  The query is validated to be a SELECT before execution.
+        Falls back gracefully when no LLM backend is configured.
+
+        Parameters
+        ----------
+        question : str
+            Natural-language question, e.g.
+            ``"What was the average reactor power last month?"``.
+
+        Returns
+        -------
+        dict
+            ``{question, sql_used, rows, row_count}`` on success, or
+            ``{question, error, rows}`` on failure.
+        """
+        schema = self._ts.get_schema_description()
+
+        # Check LLM availability via duck-typing
+        has_llm = getattr(self._rag, "_has_llm", lambda: False)()
+        if not has_llm:
+            return {
+                "question": question,
+                "sql_used": None,
+                "rows": [],
+                "error": (
+                    "LLM backend not configured. "
+                    "Set MSR_GITHUB_TOKEN or MSR_OPENAI_API_KEY for NL→SQL. "
+                    "Use query_timeseries() for direct structured queries."
+                ),
+            }
+
+        system = (
+            "You are a SQL expert for a nuclear reactor plant data system.\n"
+            "Given a natural-language question and the table schema below, "
+            "generate ONE valid SQLite SELECT query that answers the question.\n"
+            "Output ONLY the raw SQL — no explanation, no markdown fences, "
+            "no trailing semicolons.\n\n"
+            f"Schema:\n{schema}"
+        )
+        user = f"Question: {question}"
+
+        try:
+            llm_generate = getattr(self._rag, "_llm_generate")
+            sql_raw: str = llm_generate(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                max_tokens=256,
+            )
+            # Strip markdown fences the LLM may add despite instructions
+            sql = sql_raw.strip()
+            for fence in ("```sql", "```sqlite", "```"):
+                if sql.startswith(fence):
+                    sql = sql[len(fence):]
+            sql = sql.rstrip("`").strip().rstrip(";").strip()
+
+            rows = self._ts.execute_safe_select(sql)
+            return {
+                "question": question,
+                "sql_used": sql,
+                "rows": rows[:200],
+                "row_count": len(rows),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "question": question,
+                "sql_used": None,
+                "rows": [],
+                "error": str(exc),
+            }
+
+    def timeseries_status(self) -> dict[str, Any]:
+        """Return timeseries store status."""
+        return self._ts.status()
 
     def update_all(
         self,
@@ -1465,6 +2024,12 @@ class KBSourceManager:
             print(f"  Ingested: {st['total_ingested']}")
             print(f"  Last run: {st['last_run']}")
             print()
+        ts_st = self._ts.status()
+        print(f"  Source  : {ts_st['source']}")
+        print(f"  Readings: {ts_st['total_readings']}")
+        print(f"  Sensors : {ts_st['sensors']}")
+        print(f"  Last ins: {ts_st['last_insert']}")
+        print()
 
 
 # ---------------------------------------------------------------------------

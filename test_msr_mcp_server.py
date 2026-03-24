@@ -43,6 +43,9 @@ def test_tools_list():
         "get_active_alarms",
         "get_data_source_info",
         "ingest_plant_data",
+        "query_sensor_timeseries",
+        "get_sensor_stats",
+        "query_plant_data_nl",
     }
     assert expected == names
 
@@ -209,3 +212,101 @@ def test_ingest_plant_data_import_error(monkeypatch):
 def test_all_tools_have_handler():
     for tool in TOOLS:
         assert callable(tool["handler"]), f"Tool '{tool['name']}' has no callable handler"
+
+
+# ---------------------------------------------------------------------------
+# Timeseries tool tests
+# ---------------------------------------------------------------------------
+
+def test_query_sensor_timeseries_empty_store(tmp_path, monkeypatch):
+    """query_sensor_timeseries returns empty rows when store has no data."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    from msr_mcp_server import query_sensor_timeseries
+    result = query_sensor_timeseries("reactor_power_mw")
+    assert result["sensor_name"] == "reactor_power_mw"
+    assert result["rows"] == []
+    assert result["count"] == 0
+
+
+def test_query_sensor_timeseries_with_data(tmp_path, monkeypatch):
+    """query_sensor_timeseries returns inserted rows."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    from msr_kb_sources import TimeseriesStore
+    ts = TimeseriesStore(kb_dir=tmp_path)
+    ts.insert_readings(
+        [{"sensor_name": "reactor_power_mw", "value": 99.5, "unit": "MW",
+          "timestamp": "2024-01-15T14:00:00Z"}],
+        source_id="test-001",
+    )
+    from msr_mcp_server import query_sensor_timeseries
+    result = query_sensor_timeseries("reactor_power_mw")
+    assert result["count"] == 1
+    assert result["rows"][0]["value"] == 99.5
+
+
+def test_query_sensor_timeseries_last_n(tmp_path, monkeypatch):
+    """query_sensor_timeseries last_n=1 returns only the most recent reading."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    from msr_kb_sources import TimeseriesStore
+    ts = TimeseriesStore(kb_dir=tmp_path)
+    ts.insert_readings(
+        [
+            {"sensor_name": "core_temperature_c", "value": 700.0,
+             "timestamp": "2024-01-15T13:00:00Z"},
+            {"sensor_name": "core_temperature_c", "value": 702.0,
+             "timestamp": "2024-01-15T14:00:00Z"},
+        ],
+        source_id="test-002",
+    )
+    from msr_mcp_server import query_sensor_timeseries
+    result = query_sensor_timeseries("core_temperature_c", last_n=1)
+    assert result["count"] == 1
+    assert result["rows"][0]["value"] == 702.0
+
+
+def test_get_sensor_stats_empty(tmp_path, monkeypatch):
+    """get_sensor_stats returns result=None when store is empty."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    from msr_mcp_server import get_sensor_stats
+    result = get_sensor_stats("reactor_power_mw", aggregation="avg")
+    assert result["sensor_name"] == "reactor_power_mw"
+    assert result["result"] is None
+
+
+def test_get_sensor_stats_with_data(tmp_path, monkeypatch):
+    """get_sensor_stats returns correct avg / min / max."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    from msr_kb_sources import TimeseriesStore
+    ts = TimeseriesStore(kb_dir=tmp_path)
+    ts.insert_readings(
+        [
+            {"sensor_name": "reactor_power_mw", "value": 90.0,
+             "timestamp": "2024-01-15T12:00:00Z"},
+            {"sensor_name": "reactor_power_mw", "value": 110.0,
+             "timestamp": "2024-01-15T13:00:00Z"},
+        ],
+        source_id="test-003",
+    )
+    from msr_mcp_server import get_sensor_stats
+    avg_result = get_sensor_stats("reactor_power_mw", aggregation="avg")
+    assert avg_result["result"] == 100.0
+
+    min_result = get_sensor_stats("reactor_power_mw", aggregation="min")
+    assert min_result["result"] == 90.0
+
+    max_result = get_sensor_stats("reactor_power_mw", aggregation="max")
+    assert max_result["result"] == 110.0
+
+
+def test_query_plant_data_nl_no_llm(tmp_path, monkeypatch):
+    """query_plant_data_nl returns graceful error when no LLM is configured."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    monkeypatch.delenv("MSR_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("MSR_USE_LOCAL_GPU", raising=False)
+    from msr_mcp_server import query_plant_data_nl
+    result = query_plant_data_nl("What was the average power?")
+    assert result["question"] == "What was the average power?"
+    # Should return error or empty rows — not raise
+    assert "rows" in result
+    assert isinstance(result["rows"], list)

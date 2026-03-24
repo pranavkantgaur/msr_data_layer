@@ -27,12 +27,17 @@ Read tools (always present):
 - ``get_reactor_status``   – summary of key operational parameters
 - ``get_sensor_reading``   – latest value of a named sensor
 - ``get_all_sensor_readings`` – all sensor values at once
-- ``get_sensor_history``   – recent history for a sensor
+- ``get_sensor_history``   – recent history for a sensor (in-memory ring buffer)
 - ``get_active_alarms``    – active safety/operational alarms
 - ``get_data_source_info`` – data source connectivity and configuration
 
+Timeseries tools (structured numerical queries over SQLite store):
+- ``query_sensor_timeseries``   – time-range or latest-N rows for a sensor
+- ``get_sensor_stats``          – aggregate statistics (avg/min/max/count)
+- ``query_plant_data_nl``       – natural-language question → SQL → results
+
 Write tools (data ingestion):
-- ``ingest_plant_data``    – ingest operational data into the knowledge base
+- ``ingest_plant_data``    – ingest operational data into the RAG knowledge base
 
 Environment Variables
 ---------------------
@@ -289,6 +294,127 @@ def ingest_plant_data(
 
 
 # ---------------------------------------------------------------------------
+# Timeseries tool handlers (SQLite-backed structured queries)
+# ---------------------------------------------------------------------------
+
+def query_sensor_timeseries(
+    sensor_name: str,
+    start_time: str = "",
+    end_time: str = "",
+    last_n: int = 0,
+) -> dict[str, Any]:
+    """
+    Query the timeseries store for a named sensor.
+
+    Returns raw timestamped readings from the SQLite timeseries store.
+    Supports both time-range and latest-N retrieval modes.
+
+    Parameters
+    ----------
+    sensor_name : str
+        Sensor to query, e.g. ``"reactor_power_mw"`` or
+        ``"core_temperature_c"``.
+    start_time : str
+        ISO 8601 lower bound (inclusive), e.g. ``"2024-01-15T00:00:00Z"``.
+        Omit for no lower bound.
+    end_time : str
+        ISO 8601 upper bound (inclusive).  Omit for no upper bound.
+    last_n : int
+        When > 0, return the most recent *n* readings regardless of
+        *start_time* / *end_time*.
+    """
+    try:
+        from msr_kb_sources import TimeseriesStore  # noqa: PLC0415
+
+        ts = TimeseriesStore()
+        if last_n > 0:
+            rows = ts.query_latest(sensor_name, last_n=last_n)
+        else:
+            rows = ts.query_range(
+                sensor_name,
+                start=start_time or None,
+                end=end_time or None,
+            )
+        return {
+            "sensor_name": sensor_name,
+            "rows": rows,
+            "count": len(rows),
+            "data_source": "timeseries-sqlite",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc), "sensor_name": sensor_name, "rows": []}
+
+
+def get_sensor_stats(
+    sensor_name: str,
+    aggregation: str = "avg",
+    start_time: str = "",
+    end_time: str = "",
+) -> dict[str, Any]:
+    """
+    Return aggregate statistics for a sensor from the timeseries store.
+
+    Parameters
+    ----------
+    sensor_name : str
+        Sensor to aggregate, e.g. ``"reactor_power_mw"``.
+    aggregation : str
+        Statistic to compute: ``"avg"`` (default), ``"min"``, ``"max"``,
+        or ``"count"``.
+    start_time : str
+        ISO 8601 lower bound (inclusive).  Omit for all time.
+    end_time : str
+        ISO 8601 upper bound (inclusive).  Omit for all time.
+    """
+    try:
+        from msr_kb_sources import TimeseriesStore  # noqa: PLC0415
+
+        ts = TimeseriesStore()
+        result = ts.query_aggregate(
+            sensor_name,
+            agg=aggregation,
+            start=start_time or None,
+            end=end_time or None,
+        )
+        result["data_source"] = "timeseries-sqlite"
+        return result
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc), "sensor_name": sensor_name}
+
+
+def query_plant_data_nl(question: str) -> dict[str, Any]:
+    """
+    Answer a natural-language question about plant timeseries data using
+    LLM-assisted SQL generation (NL→SQL).
+
+    The LLM generates a SQLite SELECT query from the question and the
+    timeseries schema.  The query is validated as a SELECT before execution
+    and results are returned as structured JSON.
+
+    Parameters
+    ----------
+    question : str
+        Natural-language question, e.g.
+        ``"What was the average reactor power last week?"`` or
+        ``"List all core temperature readings above 710 °C"``.
+    """
+    try:
+        from msr_kb_sources import KBSourceManager  # noqa: PLC0415
+        from msr_digital_twin_with_rag import MSRDigitalTwinRAG  # noqa: PLC0415
+
+        rag = MSRDigitalTwinRAG()
+        mgr = KBSourceManager(rag)
+        return mgr.query_timeseries_nl(question)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "question": question,
+            "sql_used": None,
+            "rows": [],
+            "error": str(exc),
+        }
+
+
+# ---------------------------------------------------------------------------
 # MCP tool registry
 # ---------------------------------------------------------------------------
 
@@ -379,6 +505,95 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["content"],
         },
         "handler": ingest_plant_data,
+    },
+    {
+        "name": "query_sensor_timeseries",
+        "description": (
+            "Query the SQLite timeseries store for raw timestamped readings of a named sensor. "
+            "Supports time-range filtering (start_time / end_time) or latest-N retrieval."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sensor_name": {
+                    "type": "string",
+                    "description": "Sensor to query, e.g. 'reactor_power_mw'.",
+                },
+                "start_time": {
+                    "type": "string",
+                    "description": "ISO 8601 lower bound (inclusive), e.g. '2024-01-15T00:00:00Z'.",
+                    "default": "",
+                },
+                "end_time": {
+                    "type": "string",
+                    "description": "ISO 8601 upper bound (inclusive).",
+                    "default": "",
+                },
+                "last_n": {
+                    "type": "integer",
+                    "description": "When > 0, return the most recent n readings.",
+                    "default": 0,
+                },
+            },
+            "required": ["sensor_name"],
+        },
+        "handler": query_sensor_timeseries,
+    },
+    {
+        "name": "get_sensor_stats",
+        "description": (
+            "Return aggregate statistics (avg / min / max / count) for a sensor "
+            "from the SQLite timeseries store, optionally within a time range."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sensor_name": {
+                    "type": "string",
+                    "description": "Sensor to aggregate, e.g. 'core_temperature_c'.",
+                },
+                "aggregation": {
+                    "type": "string",
+                    "description": "Statistic: 'avg' (default), 'min', 'max', or 'count'.",
+                    "default": "avg",
+                },
+                "start_time": {
+                    "type": "string",
+                    "description": "ISO 8601 lower bound (inclusive). Omit for all time.",
+                    "default": "",
+                },
+                "end_time": {
+                    "type": "string",
+                    "description": "ISO 8601 upper bound (inclusive). Omit for all time.",
+                    "default": "",
+                },
+            },
+            "required": ["sensor_name"],
+        },
+        "handler": get_sensor_stats,
+    },
+    {
+        "name": "query_plant_data_nl",
+        "description": (
+            "Answer a natural-language question about plant timeseries data "
+            "using LLM-assisted SQL generation (NL→SQL). "
+            "Requires an LLM backend (MSR_GITHUB_TOKEN or MSR_OPENAI_API_KEY)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": (
+                        "Natural-language question about plant data, e.g. "
+                        "'What was the average reactor power last week?' "
+                        "or 'List all core temperature readings above 710 °C'."
+                    ),
+                },
+            },
+            "required": ["question"],
+        },
+        "handler": query_plant_data_nl,
     },
 ]
 
