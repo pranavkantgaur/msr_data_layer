@@ -734,3 +734,126 @@ class TestRAGCache:
              patch.dict("sys.modules", {"msr_digital_twin_with_rag": mock_module}):
             lf._get_rag()
         assert os.environ.get("MSR_KB_DIR") == "/tmp/kb_store"
+
+
+# ---------------------------------------------------------------------------
+# Timeseries endpoint tests
+# ---------------------------------------------------------------------------
+
+class TestTimeseriesEndpoints:
+    """Tests for POST /timeseries/ingest and POST /timeseries/query."""
+
+    def _event(self, path: str, body: dict) -> dict:
+        import json
+        return {
+            "requestContext": {"http": {"method": "POST"}},
+            "rawPath": path,
+            "body": json.dumps(body),
+            "isBase64Encoded": False,
+        }
+
+    def test_timeseries_ingest_missing_readings(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+        import lambda_function as lf
+        event = self._event("/timeseries/ingest", {"source_id": "x"})
+        resp = lf._handle_timeseries_ingest({"source_id": "x"})
+        assert resp["statusCode"] == 400
+
+    def test_timeseries_ingest_success(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+        from unittest.mock import MagicMock, patch
+        import lambda_function as lf
+        mock_rag = MagicMock()
+        mock_rag.add_document.return_value = 1
+        lf._rag_cache = None
+        body = {
+            "readings": [
+                {"sensor_name": "reactor_power_mw", "value": 99.5,
+                 "unit": "MW", "timestamp": "2024-01-15T14:00:00Z"}
+            ],
+            "source_id": "lambda-ts-001",
+            "also_ingest_text": False,
+        }
+        with patch("lambda_function._get_rag", return_value=mock_rag), \
+             patch("lambda_function.sync_kb_to_s3"):
+            resp = lf._handle_timeseries_ingest(body)
+        import json
+        data = json.loads(resp["body"])
+        assert resp["statusCode"] == 200
+        assert data["success"] is True
+        assert data["timeseries_rows"] == 1
+
+    def test_timeseries_query_missing_params(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+        from unittest.mock import MagicMock, patch
+        import lambda_function as lf
+        mock_rag = MagicMock()
+        with patch("lambda_function._get_rag", return_value=mock_rag):
+            resp = lf._handle_timeseries_query({})
+        assert resp["statusCode"] == 400
+
+    def test_timeseries_query_structured(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+        from unittest.mock import MagicMock, patch
+        import lambda_function as lf
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        ts.insert_readings(
+            [{"sensor_name": "reactor_power_mw", "value": 99.5,
+              "unit": "MW", "timestamp": "2024-01-15T14:00:00Z"}],
+            source_id="lts-q-001",
+        )
+        mock_rag = MagicMock()
+        mock_rag.add_document.return_value = 1
+        with patch("lambda_function._get_rag", return_value=mock_rag):
+            resp = lf._handle_timeseries_query({"sensor_name": "reactor_power_mw"})
+        import json
+        data = json.loads(resp["body"])
+        assert resp["statusCode"] == 200
+        assert data["count"] == 1
+
+    def test_timeseries_route_ingest(self, monkeypatch, tmp_path):
+        """_route_http dispatches POST /timeseries/ingest correctly."""
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+        from unittest.mock import patch
+        import lambda_function as lf
+        import json
+        event = {
+            "requestContext": {"http": {"method": "POST"}},
+            "rawPath": "/timeseries/ingest",
+            "body": json.dumps({
+                "readings": [{"sensor_name": "x", "value": 1.0,
+                               "timestamp": "2024-01-15T14:00:00Z"}],
+                "source_id": "route-test-001",
+                "also_ingest_text": False,
+            }),
+            "isBase64Encoded": False,
+        }
+        from unittest.mock import MagicMock
+        mock_rag = MagicMock()
+        mock_rag.add_document.return_value = 1
+        with patch("lambda_function._is_authenticated", return_value=True), \
+             patch("lambda_function._get_rag", return_value=mock_rag), \
+             patch("lambda_function.sync_kb_to_s3"):
+            resp = lf._route_http(event)
+        data = json.loads(resp["body"])
+        assert resp["statusCode"] == 200
+        assert data["success"] is True
+
+    def test_timeseries_route_query(self, monkeypatch, tmp_path):
+        """_route_http dispatches POST /timeseries/query correctly."""
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+        from unittest.mock import patch, MagicMock
+        import lambda_function as lf
+        import json
+        event = {
+            "requestContext": {"http": {"method": "POST"}},
+            "rawPath": "/timeseries/query",
+            "body": json.dumps({"sensor_name": "reactor_power_mw"}),
+            "isBase64Encoded": False,
+        }
+        mock_rag = MagicMock()
+        with patch("lambda_function._is_authenticated", return_value=True), \
+             patch("lambda_function._get_rag", return_value=mock_rag):
+            resp = lf._route_http(event)
+        assert resp["statusCode"] == 200

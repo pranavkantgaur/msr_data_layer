@@ -1106,3 +1106,265 @@ def test_kb_source_manager_status_shows_all_sources(source_manager, capsys):
     assert "arxiv" in out_lower
     assert "semantic scholar" in out_lower
     assert "openalex" in out_lower or "open" in out_lower
+
+
+# ---------------------------------------------------------------------------
+# TimeseriesStore tests
+# ---------------------------------------------------------------------------
+
+class TestTimeseriesStore:
+    """Unit tests for TimeseriesStore."""
+
+    def test_init_creates_db(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        assert (tmp_path / "plant_timeseries.db").exists()
+
+    def test_insert_and_query_range(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        readings = [
+            {"sensor_name": "reactor_power_mw", "value": 99.5, "unit": "MW",
+             "timestamp": "2024-01-15T14:00:00Z"},
+            {"sensor_name": "reactor_power_mw", "value": 100.2, "unit": "MW",
+             "timestamp": "2024-01-15T14:05:00Z"},
+        ]
+        n = ts.insert_readings(readings, source_id="src-001")
+        assert n == 2
+        rows = ts.query_range("reactor_power_mw")
+        assert len(rows) == 2
+        assert rows[0]["value"] == 99.5
+
+    def test_deduplication(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        readings = [{"sensor_name": "core_temperature_c", "value": 700.0,
+                     "timestamp": "2024-01-15T14:00:00Z"}]
+        first = ts.insert_readings(readings, source_id="dup-001")
+        second = ts.insert_readings(readings, source_id="dup-001")
+        assert first == 1
+        assert second == 0  # duplicate → no-op
+        rows = ts.query_range("core_temperature_c")
+        assert len(rows) == 1
+
+    def test_query_latest(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        readings = [
+            {"sensor_name": "core_temperature_c", "value": 700.0,
+             "timestamp": "2024-01-15T12:00:00Z"},
+            {"sensor_name": "core_temperature_c", "value": 705.0,
+             "timestamp": "2024-01-15T13:00:00Z"},
+            {"sensor_name": "core_temperature_c", "value": 710.0,
+             "timestamp": "2024-01-15T14:00:00Z"},
+        ]
+        ts.insert_readings(readings, source_id="src-002")
+        latest = ts.query_latest("core_temperature_c", last_n=2)
+        assert len(latest) == 2
+        assert latest[0]["value"] == 710.0  # newest first
+
+    def test_query_aggregate_avg(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        readings = [
+            {"sensor_name": "reactor_power_mw", "value": 90.0,
+             "timestamp": "2024-01-15T12:00:00Z"},
+            {"sensor_name": "reactor_power_mw", "value": 110.0,
+             "timestamp": "2024-01-15T13:00:00Z"},
+        ]
+        ts.insert_readings(readings, source_id="src-003")
+        result = ts.query_aggregate("reactor_power_mw", agg="avg")
+        assert result["result"] == 100.0
+        assert result["n"] == 2
+
+    def test_query_aggregate_min_max(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        readings = [
+            {"sensor_name": "neutron_flux", "value": 2.0, "timestamp": "2024-01-15T12:00:00Z"},
+            {"sensor_name": "neutron_flux", "value": 5.0, "timestamp": "2024-01-15T13:00:00Z"},
+        ]
+        ts.insert_readings(readings, source_id="src-004")
+        assert ts.query_aggregate("neutron_flux", agg="min")["result"] == 2.0
+        assert ts.query_aggregate("neutron_flux", agg="max")["result"] == 5.0
+
+    def test_query_range_with_bounds(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        readings = [
+            {"sensor_name": "core_temperature_c", "value": 700.0,
+             "timestamp": "2024-01-14T12:00:00Z"},
+            {"sensor_name": "core_temperature_c", "value": 705.0,
+             "timestamp": "2024-01-15T12:00:00Z"},
+            {"sensor_name": "core_temperature_c", "value": 710.0,
+             "timestamp": "2024-01-16T12:00:00Z"},
+        ]
+        ts.insert_readings(readings, source_id="src-005")
+        rows = ts.query_range(
+            "core_temperature_c",
+            start="2024-01-15T00:00:00Z",
+            end="2024-01-15T23:59:59Z",
+        )
+        assert len(rows) == 1
+        assert rows[0]["value"] == 705.0
+
+    def test_list_sensors(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        ts.insert_readings(
+            [{"sensor_name": "sensor_a", "value": 1.0, "timestamp": "2024-01-15T12:00:00Z"},
+             {"sensor_name": "sensor_b", "value": 2.0, "timestamp": "2024-01-15T12:00:00Z"}],
+            source_id="src-006",
+        )
+        sensors = ts.list_sensors()
+        assert "sensor_a" in sensors
+        assert "sensor_b" in sensors
+
+    def test_execute_safe_select(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        ts.insert_readings(
+            [{"sensor_name": "reactor_power_mw", "value": 99.8, "unit": "MW",
+              "timestamp": "2024-01-15T14:00:00Z"}],
+            source_id="src-007",
+        )
+        rows = ts.execute_safe_select(
+            "SELECT sensor_name, value FROM sensor_readings WHERE sensor_name='reactor_power_mw'"
+        )
+        assert len(rows) == 1
+        assert rows[0]["value"] == 99.8
+
+    def test_execute_safe_select_rejects_mutation(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        import pytest
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        with pytest.raises(ValueError, match="Only SELECT"):
+            ts.execute_safe_select("DELETE FROM sensor_readings")
+
+    def test_status_reflects_inserts(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        ts.insert_readings(
+            [{"sensor_name": "reactor_power_mw", "value": 99.0,
+              "timestamp": "2024-01-15T14:00:00Z"}],
+            source_id="src-008",
+        )
+        st = ts.status()
+        assert st["total_readings"] == 1
+        assert "reactor_power_mw" in st["sensors"]
+        assert st["source_ids_count"] == 1
+
+    def test_source_id_exists(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        assert not ts.source_id_exists("new-id")
+        ts.insert_readings(
+            [{"sensor_name": "x", "value": 1.0, "timestamp": "2024-01-15T12:00:00Z"}],
+            source_id="new-id",
+        )
+        assert ts.source_id_exists("new-id")
+
+    def test_get_schema_description(self, tmp_path):
+        from msr_kb_sources import TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        desc = ts.get_schema_description()
+        assert "sensor_readings" in desc
+        assert "timestamp" in desc
+        assert "sensor_name" in desc
+        assert "Only SELECT" in desc
+
+
+# ---------------------------------------------------------------------------
+# KBSourceManager timeseries integration tests
+# ---------------------------------------------------------------------------
+
+class TestKBSourceManagerTimeseries:
+    """Integration tests for KBSourceManager timeseries methods."""
+
+    def test_ingest_timeseries_inserts_rows(self, tmp_path):
+        from unittest.mock import MagicMock
+        from msr_kb_sources import KBSourceManager
+        rag_mock = MagicMock()
+        rag_mock.add_document.return_value = 1
+        mgr = KBSourceManager(rag_mock, kb_dir=tmp_path)
+        result = mgr.ingest_timeseries(
+            [{"sensor_name": "reactor_power_mw", "value": 99.5, "unit": "MW",
+              "timestamp": "2024-01-15T14:00:00Z"}],
+            source_id="ts-test-001",
+            also_ingest_text=False,
+        )
+        assert result["timeseries_rows"] == 1
+
+    def test_ingest_timeseries_deduplication(self, tmp_path):
+        from unittest.mock import MagicMock
+        from msr_kb_sources import KBSourceManager
+        rag_mock = MagicMock()
+        rag_mock.add_document.return_value = 1
+        mgr = KBSourceManager(rag_mock, kb_dir=tmp_path)
+        mgr.ingest_timeseries(
+            [{"sensor_name": "core_temperature_c", "value": 700.0,
+              "timestamp": "2024-01-15T14:00:00Z"}],
+            source_id="ts-dup-001",
+            also_ingest_text=False,
+        )
+        second = mgr.ingest_timeseries(
+            [{"sensor_name": "core_temperature_c", "value": 700.0,
+              "timestamp": "2024-01-15T14:00:00Z"}],
+            source_id="ts-dup-001",
+            also_ingest_text=False,
+        )
+        assert second["timeseries_rows"] == 0
+
+    def test_query_timeseries_structured(self, tmp_path):
+        from unittest.mock import MagicMock
+        from msr_kb_sources import KBSourceManager
+        rag_mock = MagicMock()
+        rag_mock.add_document.return_value = 1
+        mgr = KBSourceManager(rag_mock, kb_dir=tmp_path)
+        mgr.ingest_timeseries(
+            [{"sensor_name": "reactor_power_mw", "value": 99.5, "unit": "MW",
+              "timestamp": "2024-01-15T14:00:00Z"}],
+            source_id="ts-q-001",
+            also_ingest_text=False,
+        )
+        result = mgr.query_timeseries("reactor_power_mw")
+        assert result["count"] == 1
+        assert result["rows"][0]["value"] == 99.5
+
+    def test_query_timeseries_aggregation(self, tmp_path):
+        from unittest.mock import MagicMock
+        from msr_kb_sources import KBSourceManager
+        rag_mock = MagicMock()
+        rag_mock.add_document.return_value = 1
+        mgr = KBSourceManager(rag_mock, kb_dir=tmp_path)
+        mgr.ingest_timeseries(
+            [
+                {"sensor_name": "reactor_power_mw", "value": 80.0,
+                 "timestamp": "2024-01-15T12:00:00Z"},
+                {"sensor_name": "reactor_power_mw", "value": 120.0,
+                 "timestamp": "2024-01-15T13:00:00Z"},
+            ],
+            source_id="ts-agg-001",
+            also_ingest_text=False,
+        )
+        result = mgr.query_timeseries("reactor_power_mw", aggregation="avg")
+        assert result["result"] == 100.0
+
+    def test_query_timeseries_nl_no_llm(self, tmp_path):
+        from unittest.mock import MagicMock
+        from msr_kb_sources import KBSourceManager
+        rag_mock = MagicMock()
+        rag_mock._has_llm = lambda: False
+        mgr = KBSourceManager(rag_mock, kb_dir=tmp_path)
+        result = mgr.query_timeseries_nl("What was the average power?")
+        assert "error" in result
+        assert result["rows"] == []
+
+    def test_timeseries_status(self, tmp_path):
+        from unittest.mock import MagicMock
+        from msr_kb_sources import KBSourceManager
+        rag_mock = MagicMock()
+        mgr = KBSourceManager(rag_mock, kb_dir=tmp_path)
+        st = mgr.timeseries_status()
+        assert "total_readings" in st
+        assert "sensors" in st

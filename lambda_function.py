@@ -22,7 +22,16 @@ handles all four concerns:
    operational data (sensor snapshots, event logs, maintenance reports) from
    operators or agents and ingests it into the RAG knowledge base.
 
-5. **Health endpoint** (``GET /health``) – returns 200 with service metadata
+5. **Timeseries query endpoint** (``POST /timeseries/query``) – accepts either
+   a structured ``{sensor_name, start_time, end_time, last_n, aggregation}``
+   payload or a natural-language ``{question}`` payload and returns sensor
+   readings or statistics from the SQLite timeseries store.
+
+6. **Timeseries ingest endpoint** (``POST /timeseries/ingest``) – accepts
+   ``{readings: [...], source_id, data_type}`` and inserts timestamped sensor
+   readings into the SQLite timeseries store (and optionally the RAG KB).
+
+7. **Health endpoint** (``GET /health``) – returns 200 with service metadata
    for load-balancer checks and uptime monitoring.
 
 Knowledge Base Persistence
@@ -510,6 +519,118 @@ def _handle_scheduled_kb_update(event: dict[str, Any]) -> dict[str, Any]:
     return {"success": True, "added": added}
 
 
+def _handle_timeseries_ingest(body: dict[str, Any]) -> dict[str, Any]:
+    """
+    ``POST /timeseries/ingest`` – ingest timestamped sensor readings into the
+    SQLite timeseries store (and optionally into the RAG KB as text).
+
+    Expected body::
+
+        {
+            "readings": [
+                {"sensor_name": "reactor_power_mw", "value": 99.8,
+                 "unit": "MW", "timestamp": "2024-01-15T14:00:00Z"},
+                ...
+            ],
+            "source_id": "scada-20240115T1400Z",
+            "data_type": "sensor_snapshot",   // optional
+            "also_ingest_text": true           // optional (default true)
+        }
+    """
+    readings = body.get("readings")
+    if not readings or not isinstance(readings, list):
+        return _error(400, "'readings' must be a non-empty list.")
+
+    source_id: str = body.get("source_id", "")
+    if not source_id:
+        import time as _time  # noqa: PLC0415
+        source_id = f"timeseries-{_time.strftime('%Y%m%dT%H%M%SZ', _time.gmtime())}"
+    data_type: str = body.get("data_type", "sensor_snapshot")
+    also_ingest_text: bool = bool(body.get("also_ingest_text", True))
+
+    try:
+        from msr_kb_sources import KBSourceManager  # noqa: PLC0415
+
+        rag = _get_rag()
+        mgr = KBSourceManager(rag)
+        result = mgr.ingest_timeseries(
+            readings,
+            source_id=source_id,
+            data_type=data_type,
+            also_ingest_text=also_ingest_text,
+        )
+        if result["timeseries_rows"] > 0:
+            sync_kb_to_s3()
+        return _response(200, {
+            "success": True,
+            "source_id": source_id,
+            "timeseries_rows": result["timeseries_rows"],
+            "rag_chunks": result["rag_chunks"],
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Timeseries ingest failed")
+        return _error(500, f"Timeseries ingest failed: {exc}")
+
+
+def _handle_timeseries_query(body: dict[str, Any]) -> dict[str, Any]:
+    """
+    ``POST /timeseries/query`` – query the SQLite timeseries store.
+
+    Supports two query modes:
+
+    **Structured mode** – provide ``sensor_name`` and optional bounds::
+
+        {
+            "sensor_name": "reactor_power_mw",
+            "start_time": "2024-01-15T00:00:00Z",   // optional
+            "end_time":   "2024-01-15T23:59:59Z",    // optional
+            "last_n": 10,                             // optional
+            "aggregation": "avg"                      // optional: avg/min/max/count
+        }
+
+    **Natural-language mode** – provide ``question``::
+
+        {
+            "question": "What was the average reactor power last week?"
+        }
+    """
+    question: str = body.get("question", "").strip()
+    if question:
+        # NL→SQL mode
+        try:
+            from msr_kb_sources import KBSourceManager  # noqa: PLC0415
+
+            rag = _get_rag()
+            mgr = KBSourceManager(rag)
+            result = mgr.query_timeseries_nl(question)
+            return _response(200, result)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("NL timeseries query failed")
+            return _error(500, f"Query failed: {exc}")
+
+    # Structured mode
+    sensor_name: str = body.get("sensor_name", "").strip()
+    if not sensor_name:
+        return _error(400, "Provide 'sensor_name' for structured queries or 'question' for NL queries.")
+
+    try:
+        from msr_kb_sources import KBSourceManager  # noqa: PLC0415
+
+        rag = _get_rag()
+        mgr = KBSourceManager(rag)
+        result = mgr.query_timeseries(
+            sensor_name,
+            start=body.get("start_time") or None,
+            end=body.get("end_time") or None,
+            last_n=int(body.get("last_n", 0)) or None,
+            aggregation=body.get("aggregation") or None,
+        )
+        return _response(200, result)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Structured timeseries query failed")
+        return _error(500, f"Query failed: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # API Gateway event router
 # ---------------------------------------------------------------------------
@@ -550,6 +671,14 @@ def _route_http(event: dict[str, Any]) -> dict[str, Any]:
     # Plant data ingestion endpoint
     if path == "/data/ingest" and method == "POST":
         return _handle_plant_data_ingest(parsed_body)
+
+    # Timeseries ingest endpoint
+    if path == "/timeseries/ingest" and method == "POST":
+        return _handle_timeseries_ingest(parsed_body)
+
+    # Timeseries query endpoint
+    if path == "/timeseries/query" and method == "POST":
+        return _handle_timeseries_query(parsed_body)
 
     return _error(404, f"Not found: {method} {path}")
 
