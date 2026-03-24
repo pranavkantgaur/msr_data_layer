@@ -41,7 +41,7 @@ flowchart TD
         S3B["Training corpus\n./kb_store/ (accumulated)\n→ foundation model fine-tuning"]
     end
 
-    ROBOTS -->|robotic task episodes\n(sensor + vision + action)| S2A & S2B
+    ROBOTS -->|"robotic task episodes (sensor + vision + action)"| S2A & S2B
     S1A & S1B --> S2C
     S2A & S2B --> S2C
     S2C --> S3A --> S3B

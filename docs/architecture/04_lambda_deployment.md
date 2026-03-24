@@ -36,9 +36,9 @@ flowchart TD
             CW["CloudWatch\nLog group: /aws/lambda/MSRKBFunction\nRetention: 7 days\nX-Ray service map\n+ traces per request"]
         end
 
-        APIGW -->|ALL /{proxy+}| FUNC
-        FUNC  <-->|sync_kb_from_s3()\nsync_kb_to_s3()| S3
-        EB    -->|scheduled\nEventBridge invoke| FUNC
+        APIGW -->|"ALL /{proxy+}"| FUNC
+        FUNC  <-->|"sync_kb_from_s3() sync_kb_to_s3()"| S3
+        EB    -->|scheduled EventBridge invoke| FUNC
         FUNC  --> CW
         IAM   -.->|grants| FUNC
         FUNC  -.->|optionally invokes| GFUNC

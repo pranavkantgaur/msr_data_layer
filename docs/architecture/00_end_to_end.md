@@ -32,9 +32,9 @@ flowchart TD
     end
 
     ORNL -->|HTTPS fetch| AL
-    OA   -->|REST/HTTPS|  OAL
-    AX   -->|Atom XML|    AXL
-    S2   -->|REST/HTTPS|  S2L
+    OA   -->|REST/HTTPS| OAL
+    AX   -->|Atom XML| AXL
+    S2   -->|REST/HTTPS| S2L
     AL & OAL & AXL & S2L --> KBM
 
     %% ── RAG pipeline ──────────────────────────────────────────────────────
@@ -49,8 +49,8 @@ flowchart TD
         SYNTH["6 · Multi-step synthesis\nsub-answer extraction\n→ final answer (LLM)"]
     end
 
-    KBM  -->|add_document()| CHUNK
-    PDL  -->|ingest_text() /\ningest_sensor_snapshot()| CHUNK
+    KBM  -->|"add_document()"| CHUNK
+    PDL  -->|"ingest_text() / ingest_sensor_snapshot()"| CHUNK
     CHUNK --> EMBED --> INSIGHT --> KB
     KB   -->|chunks + embeddings| HYBRID
     QDECOMP --> HYBRID
@@ -63,8 +63,8 @@ flowchart TD
         WRITE["Write tool\n• ingest_plant_data\n  → PlantDataLoader\n    → RAG pipeline"]
     end
 
-    SCADA -->|GET MSR_PLANT_DATA_URL\n(or dev stub)| READ
-    SYNTH -->|rag.answer()| READ
+    SCADA -->|"GET MSR_PLANT_DATA_URL (or dev stub)"| READ
+    SYNTH -->|"rag.answer()"| READ
     WRITE -->|calls| PDL
 
     %% ── Transport / deployment variants ───────────────────────────────────
@@ -86,7 +86,7 @@ flowchart TD
     end
 
     LAMBDA --> APIGW --> LFUNC
-    LFUNC  <-->|sync_kb_from_s3()\nsync_kb_to_s3()| S3
+    LFUNC  <-->|"sync_kb_from_s3() sync_kb_to_s3()"| S3
     EB     -->|scheduled invoke| LFUNC
     LFUNC  --> CW
 
@@ -95,7 +95,7 @@ flowchart TD
         GFUNC["MSRKBGPUFunction\nECS / EC2 / ECR\nsentence-transformers\nall-MiniLM-L6-v2\nTinyLlama-1.1B-Chat"]
     end
 
-    LAMBDA -.->|optional GPU\ncontainer path| GFUNC
+    LAMBDA -.->|optional GPU container path| GFUNC
 
     %% ── Consumers ─────────────────────────────────────────────────────────
     subgraph CONS["Consumers — LLM Agents & Operators"]
@@ -114,8 +114,8 @@ flowchart TD
         TRAIN["Foundation model\nfine-tuning corpus\n(use_cases/physical_ai/)"]
     end
 
-    ROBOT -->|robotic task episodes\nPlantDataLoader| PDL
-    KB    -->|rag.answer() for\nstructured queries| TRAIN
+    ROBOT -->|robotic task episodes PlantDataLoader| PDL
+    KB    -->|"rag.answer() for structured queries"| TRAIN
 
     %% ── Styling ───────────────────────────────────────────────────────────
     classDef extNode   fill:#e8f4f8,stroke:#2196f3,color:#000

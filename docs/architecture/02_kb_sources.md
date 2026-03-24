@@ -76,10 +76,10 @@ flowchart TD
     RAG["rag.add_document()\nmsr_digital_twin_with_rag.py"]
 
     EXT_ORNL -->|HTTPS| ARCH
-    EXT_OA   -->|REST|  OAL
-    EXT_AX   -->|XML|   AXL
-    EXT_S2   -->|REST|  S2L
-    OPS      -->|push|  PDL
+    EXT_OA   -->|REST| OAL
+    EXT_AX   -->|XML| AXL
+    EXT_S2   -->|REST| S2L
+    OPS      -->|push| PDL
 
     A5 & O6 & AX7 & S6 & P5 --> RAG
 
