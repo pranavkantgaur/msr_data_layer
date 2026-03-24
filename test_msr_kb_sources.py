@@ -1368,3 +1368,110 @@ class TestKBSourceManagerTimeseries:
         st = mgr.timeseries_status()
         assert "total_readings" in st
         assert "sensors" in st
+
+
+# ---------------------------------------------------------------------------
+# KBSourceManager full-text ingestion tests
+# ---------------------------------------------------------------------------
+
+class TestKBSourceManagerFullText:
+    """Tests for ingest_full_paper_text and list_abstract_only_sources."""
+
+    def test_ingest_full_paper_text_success(self, tmp_path):
+        from unittest.mock import MagicMock
+        from msr_kb_sources import KBSourceManager
+        rag_mock = MagicMock()
+        rag_mock.add_document.return_value = 5
+        mgr = KBSourceManager(rag_mock, kb_dir=tmp_path)
+        result = mgr.ingest_full_paper_text(
+            "arxiv:2401.12345",
+            "# Full paper text\n\nSection 1: Introduction...",
+        )
+        assert result["success"] is True
+        assert result["full_source_id"] == "full:arxiv:2401.12345"
+        assert result["chunks_added"] == 5
+        rag_mock.add_document.assert_called_once()
+
+    def test_ingest_full_paper_text_empty_text(self, tmp_path):
+        from unittest.mock import MagicMock
+        from msr_kb_sources import KBSourceManager
+        rag_mock = MagicMock()
+        mgr = KBSourceManager(rag_mock, kb_dir=tmp_path)
+        result = mgr.ingest_full_paper_text("arxiv:2401.12345", "")
+        assert result["success"] is False
+        assert "empty" in result["error"].lower()
+
+    def test_ingest_full_paper_text_empty_source_id(self, tmp_path):
+        from unittest.mock import MagicMock
+        from msr_kb_sources import KBSourceManager
+        rag_mock = MagicMock()
+        mgr = KBSourceManager(rag_mock, kb_dir=tmp_path)
+        result = mgr.ingest_full_paper_text("", "Some text")
+        assert result["success"] is False
+        assert "empty" in result["error"].lower()
+
+    def test_list_abstract_only_sources_empty(self, tmp_path):
+        from unittest.mock import MagicMock
+        from msr_kb_sources import KBSourceManager
+        rag_mock = MagicMock()
+        mgr = KBSourceManager(rag_mock, kb_dir=tmp_path)
+        sources = mgr.list_abstract_only_sources()
+        assert isinstance(sources, list)
+        assert sources == []
+
+
+# ---------------------------------------------------------------------------
+# Abstract-only prefix in loader format methods
+# ---------------------------------------------------------------------------
+
+def test_openalex_format_work_text_abstract_only_prefix():
+    """OpenAlexLoader.format_work_text() prefixes abstract-only marker."""
+    from msr_kb_sources import OpenAlexLoader
+    work = {
+        "id": "https://openalex.org/W123",
+        "title": "Molten salt corrosion study",
+        "publication_year": 2024,
+        "doi": "10.1016/j.jnucmat.2024.01.001",
+        "abstract_inverted_index": {"Molten": [0], "salt": [1]},
+        "authorships": [],
+        "open_access": {},
+    }
+    text, source_id = OpenAlexLoader.format_work_text(work)
+    assert "ABSTRACT ONLY" in text
+    assert "ingest_full_paper_text" in text
+    assert source_id == "https://openalex.org/W123"
+
+
+def test_arxiv_format_entry_text_abstract_only_prefix():
+    """ArXivLoader.format_entry_text() prefixes abstract-only marker."""
+    from msr_kb_sources import ArXivLoader
+    entry = {
+        "id": "2401.12345",
+        "title": "TMSR-LF1 safety analysis",
+        "published": "2024-01-15",
+        "abstract": "We study the transient behaviour...",
+        "authors": ["Zhang, W.", "Li, H."],
+        "doi": "",
+    }
+    text, source_id = ArXivLoader.format_entry_text(entry)
+    assert "ABSTRACT ONLY" in text
+    assert "ingest_full_paper_text" in text
+    assert source_id == "arxiv:2401.12345"
+
+
+def test_s2_format_paper_text_abstract_only_prefix():
+    """SemanticScholarLoader.format_paper_text() prefixes abstract-only marker."""
+    from msr_kb_sources import SemanticScholarLoader
+    paper = {
+        "paperId": "abc123",
+        "title": "Fluoride salt properties",
+        "year": 2023,
+        "abstract": "We measured viscosity...",
+        "authors": [{"name": "Wang, X."}],
+        "externalIds": {},
+        "openAccessPdf": None,
+    }
+    text, source_id = SemanticScholarLoader.format_paper_text(paper)
+    assert "ABSTRACT ONLY" in text
+    assert "ingest_full_paper_text" in text
+    assert source_id == "s2:abc123"

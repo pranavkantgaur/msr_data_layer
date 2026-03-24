@@ -37,7 +37,8 @@ Timeseries tools (structured numerical queries over SQLite store):
 - ``query_plant_data_nl``       – natural-language question → SQL → results
 
 Write tools (data ingestion):
-- ``ingest_plant_data``    – ingest operational data into the RAG knowledge base
+- ``ingest_plant_data``         – ingest operational data into the RAG knowledge base
+- ``ingest_full_paper_text``    – upgrade an abstract-only KB entry to full paper text
 
 Environment Variables
 ---------------------
@@ -414,6 +415,48 @@ def query_plant_data_nl(question: str) -> dict[str, Any]:
         }
 
 
+def ingest_full_paper_text(
+    source_id: str,
+    markdown_text: str,
+) -> dict[str, Any]:
+    """
+    Upgrade an abstract-only KB entry to the full paper text.
+
+    Papers ingested automatically from OpenAlex, arXiv, or Semantic Scholar
+    are stored as ``[ABSTRACT ONLY]`` entries.  Call this tool when you have
+    the full text of a paper (as plain text or Markdown) and want to make it
+    fully searchable by the RAG pipeline.
+
+    The full text is stored under the key ``full:<source_id>`` alongside
+    the existing abstract chunks.  Duplicate calls are safe (the RAG pipeline
+    skips chunks already present).
+
+    Parameters
+    ----------
+    source_id : str
+        The source identifier of the existing abstract-only KB entry, e.g.
+        ``https://openalex.org/W1234567`` or ``arxiv:2401.12345`` or
+        ``s2:abc123def456``.
+    markdown_text : str
+        Full paper text in Markdown format (plain text is also accepted).
+        Obtain this by converting a PDF with a VLM or pdftotext and passing
+        the result here.
+    """
+    if not source_id or not source_id.strip():
+        return {"success": False, "error": "source_id must not be empty."}
+    if not markdown_text or not markdown_text.strip():
+        return {"success": False, "error": "markdown_text must not be empty."}
+    try:
+        from msr_kb_sources import KBSourceManager  # noqa: PLC0415
+        from msr_digital_twin_with_rag import MSRDigitalTwinRAG  # noqa: PLC0415
+
+        rag = MSRDigitalTwinRAG()
+        mgr = KBSourceManager(rag)
+        return mgr.ingest_full_paper_text(source_id, markdown_text)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "source_id": source_id, "error": str(exc)}
+
+
 # ---------------------------------------------------------------------------
 # MCP tool registry
 # ---------------------------------------------------------------------------
@@ -594,6 +637,36 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["question"],
         },
         "handler": query_plant_data_nl,
+    },
+    {
+        "name": "ingest_full_paper_text",
+        "description": (
+            "Upgrade an abstract-only KB entry to the full text of a research paper. "
+            "Papers from OpenAlex, arXiv, and Semantic Scholar are indexed with abstracts only. "
+            "Use this tool to provide the full paper text (in Markdown or plain text) "
+            "so the RAG pipeline can search across all sections."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_id": {
+                    "type": "string",
+                    "description": (
+                        "Source identifier of the existing abstract-only KB entry, e.g. "
+                        "'https://openalex.org/W1234567', 'arxiv:2401.12345', or 's2:abc123'."
+                    ),
+                },
+                "markdown_text": {
+                    "type": "string",
+                    "description": (
+                        "Full paper text in Markdown or plain text. "
+                        "Obtain by converting a PDF with a VLM or pdftotext."
+                    ),
+                },
+            },
+            "required": ["source_id", "markdown_text"],
+        },
+        "handler": ingest_full_paper_text,
     },
 ]
 
