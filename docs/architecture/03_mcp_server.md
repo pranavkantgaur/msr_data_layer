@@ -16,6 +16,9 @@ classDiagram
         +get_sensor_history(sensor_name, last_n) dict
         +get_active_alarms() dict
         +get_data_source_info() dict
+        +query_sensor_timeseries(sensor_name, start_time, end_time, last_n) dict
+        +get_sensor_stats(sensor_name, aggregation, start_time, end_time) dict
+        +query_plant_data_nl(question) dict
         +ingest_plant_data(content, source_id, data_type) dict
     }
 
@@ -32,6 +35,7 @@ classDiagram
         +MSRDigitalTwinRAG
         +answer(question) str
         +add_document(text, source_id) None
+        +_llm_generate(messages, max_tokens) str
     }
 
     class PlantDataLoader {
@@ -40,9 +44,30 @@ classDiagram
         +ingest_sensor_snapshot(rag, readings, source_id) None
     }
 
+    class TimeseriesStore {
+        <<msr_kb_sources.py — SQLite sqlite3>>
+        +insert_readings(readings, source_id) int
+        +query_range(sensor, start, end) list
+        +query_latest(sensor, last_n) list
+        +query_aggregate(sensor, agg) dict
+        +execute_safe_select(sql) list
+        +get_schema_description() str
+    }
+
+    class KBSourceManager {
+        <<msr_kb_sources.py>>
+        +ingest_timeseries(readings, source_id) dict
+        +query_timeseries(sensor, ...) dict
+        +query_timeseries_nl(question) dict
+    }
+
     MSRMCPServer --> PlantDataLayer : read tools use
     MSRMCPServer --> RAGPipeline : queries via
     MSRMCPServer --> PlantDataLoader : ingest_plant_data calls
+    MSRMCPServer --> TimeseriesStore : timeseries tools use
+    MSRMCPServer --> KBSourceManager : query_plant_data_nl uses
+    KBSourceManager --> TimeseriesStore : orchestrates
+    KBSourceManager --> RAGPipeline : NL→SQL via _llm_generate
 ```
 
 ---
@@ -146,9 +171,11 @@ flowchart LR
         R3["POST /kb/update\n{source: archive|openalex|\narxiv|semanticscholar|all}"]
         R4["POST /data/ingest\n{content, source_id, data_type}"]
         R5["GET  /health\n→ {status, version, ...}"]
+        R6["POST /timeseries/ingest\n{readings, source_id, data_type}"]
+        R7["POST /timeseries/query\n{sensor_name, ...} or {question}"]
     end
 
-    APIGW <--> R1 & R2 & R3 & R4 & R5
+    APIGW <--> R1 & R2 & R3 & R4 & R5 & R6 & R7
 
     classDef route fill:#e8f4f8,stroke:#2196f3,color:#000
     class R1,R2,R3,R4,R5 route

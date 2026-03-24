@@ -24,6 +24,7 @@ Chinese TMSR-LF1 or the historic ORNL MSRE.
 | **Knowledge retrieval** | Multi-step RAG over ORNL MSR archive, OpenAlex papers, and plant-specific documents |
 | **Live data reading** | MCP tools that read current plant sensor state from an external SCADA/historian REST API (or a development stub) |
 | **Data ingestion** | `ingest_plant_data` MCP tool + Lambda endpoint (`POST /data/ingest`) for pushing sensor snapshots, event logs, and maintenance reports into the KB |
+| **Timeseries storage & query** | `TimeseriesStore` (SQLite `sqlite3` stdlib) for structured plant sensor timeseries; MCP tools `query_sensor_timeseries`, `get_sensor_stats`, `query_plant_data_nl` (NL→SQL); Lambda endpoints `POST /timeseries/ingest` and `POST /timeseries/query` |
 | **Physical AI training data** | Use cases in `use_cases/physical_ai/` documenting how the data layer feeds foundation-model training for 12 robotic operational areas |
 | **MCP server** | stdio and HTTP transports; deployable as AWS Lambda + API Gateway or as a local process |
 | **GPU acceleration** | Optional local GPU embedding/generation via sentence-transformers + HuggingFace Transformers |
@@ -39,6 +40,7 @@ Chinese TMSR-LF1 or the historic ORNL MSRE.
 | Real-time neutronics or thermal-hydraulics solvers | Compute-intensive; use dedicated simulation codes (RESTA-3D, RELAP5-TMSR) |
 | Direct database writes outside the defined ingest API | Bypasses auditability and schema contracts |
 | New Python packages not in `requirements_*.txt` | Stack must remain auditable; open a discussion before adding dependencies |
+| NL→SQL DDL/DML queries (`INSERT`, `UPDATE`, `DELETE`, `DROP`, etc.) | The `TimeseriesStore.execute_safe_select()` validates that only `SELECT` is executed; mutation via NL→SQL is explicitly prohibited |
 
 ---
 

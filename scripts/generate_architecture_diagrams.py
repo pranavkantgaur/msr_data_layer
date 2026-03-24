@@ -74,9 +74,13 @@ _DIAGRAM_CONFIGS: list[dict] = [
         "description": (
             "Full end-to-end architecture showing every component and data flow: "
             "external data sources (ORNL archive, OpenAlex, arXiv, Semantic Scholar, "
-            "SCADA/historian) → KB source loaders → RAG pipeline → MCP server → "
+            "SCADA/historian, sensor push) → KB source loaders → RAG pipeline → "
+            "TimeseriesStore (SQLite plant_timeseries.db) → MCP server → "
             "transport variants (stdio and Lambda/HTTP) → AWS infrastructure → "
-            "GPU container variant → consuming agents and operators."
+            "GPU container variant → consuming agents and operators. "
+            "New timeseries layer: TimeseriesStore insert/query/NL→SQL, "
+            "new MCP tools (query_sensor_timeseries, get_sensor_stats, query_plant_data_nl), "
+            "new Lambda routes POST /timeseries/ingest and POST /timeseries/query."
         ),
         "source_files": [
             "msr_kb_sources.py",
@@ -105,6 +109,10 @@ _DIAGRAM_CONFIGS: list[dict] = [
         "description": (
             "Knowledge-base source loaders: MSRArchiveLoader, OpenAlexLoader, "
             "ArXivLoader, SemanticScholarLoader, PlantDataLoader, KBSourceManager. "
+            "New: TimeseriesStore (SQLite sqlite3 stdlib) — plant sensor timeseries "
+            "with time-range queries, aggregate statistics, and NL→SQL via "
+            "execute_safe_select() + get_schema_description(); "
+            "KBSourceManager.ingest_timeseries(), query_timeseries(), query_timeseries_nl(). "
             "State-file deduplication sequence.  CLI reference and environment variables."
         ),
         "source_files": [
@@ -115,14 +123,20 @@ _DIAGRAM_CONFIGS: list[dict] = [
         "filename": "03_mcp_server.md",
         "description": (
             "MCP server tool surface (class diagram showing MSRMCPServer, "
-            "PlantDataLayer, RAGPipeline, PlantDataLoader); read-tool data flow; "
-            "write-tool (ingest_plant_data) data flow; stdio transport for local "
-            "agents / Claude Desktop / Copilot; HTTP transport for Lambda / local-api; "
+            "PlantDataLayer, RAGPipeline, PlantDataLoader, TimeseriesStore, "
+            "KBSourceManager); read-tool data flow; "
+            "write-tool (ingest_plant_data) data flow; "
+            "new timeseries tools: query_sensor_timeseries, get_sensor_stats, "
+            "query_plant_data_nl (NL→SQL via LLM + TimeseriesStore.execute_safe_select); "
+            "stdio transport for local agents / Claude Desktop / Copilot; "
+            "HTTP transport for Lambda / local-api with new routes "
+            "POST /timeseries/ingest and POST /timeseries/query; "
             "sensor stub values."
         ),
         "source_files": [
             "msr_mcp_server.py",
             "msr_mcp_server_main.py",
+            "lambda_function.py",
             "server.py",
         ],
     },

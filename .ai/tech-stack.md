@@ -25,7 +25,13 @@ services not listed here without opening a discussion first.
 | `openai` | OpenAI-compatible chat + embeddings API client (GitHub Models, OpenAI) |
 | `requests` | HTTP client for SCADA/historian REST API and OpenAlex |
 
-All other standard-library modules only.
+Standard-library modules used (no additional install required):
+
+| Module | Purpose |
+|---|---|
+| `sqlite3` | SQLite timeseries store (`TimeseriesStore`) — plant sensor history |
+| `json`, `urllib`, `xml.etree` | HTTP clients, API parsers |
+| `pathlib`, `os`, `time` | File I/O and system utilities |
 
 ---
 
@@ -131,8 +137,12 @@ network access.
 The following are explicitly **out of scope** and must not be added:
 
 - Django, Flask, FastAPI (the HTTP layer is SAM/Lambda)
-- SQLAlchemy or any SQL ORM (KB is file-based JSON)
+- SQLAlchemy or any SQL ORM (use `sqlite3` stdlib directly)
 - Redis, Kafka, or any message broker
 - TensorFlow (use PyTorch/sentence-transformers only)
 - Simulation codes (RELAP5, MCNP, OpenMC, RESTE-3D) — these live in separate repos
 - Any nuclear data library (ENDF, JEFF) — physics is handled by simulation layer
+
+> **Note on SQLite:** The `sqlite3` standard-library module IS used for the
+> `TimeseriesStore` (plant sensor timeseries).  External SQL ORMs and
+> server-based RDBMS (PostgreSQL, MySQL, etc.) remain out of scope.
