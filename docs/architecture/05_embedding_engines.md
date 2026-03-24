@@ -33,7 +33,7 @@ flowchart TD
     C_GPU -->|yes| E_GPU
     C_GPU -->|no| C_NP
     C_NP  -->|yes| E_RP
-    C_NP  -->|no (edge case)| WARN
+    C_NP  -->|"no (edge case)"| WARN
     WARN  --> E_RP
 
     classDef engine fill:#fff8e1,stroke:#ff9800,color:#000
