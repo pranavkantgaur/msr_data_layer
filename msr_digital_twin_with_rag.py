@@ -93,10 +93,13 @@ import concurrent.futures
 import dataclasses
 import hashlib
 import json
+import logging
 import math
 import os
 import re
 import textwrap
+import time
+import urllib.error
 import urllib.request
 from collections import Counter
 from pathlib import Path
@@ -115,6 +118,9 @@ except ImportError:
     _TORCH_AVAILABLE = False
 
 from msr_digital_twin_client import MSRDigitalTwinClient
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +194,49 @@ def _cosine_sparse(a: dict[str, float], b: dict[str, float]) -> float:
     na = math.sqrt(sum(v * v for v in a.values()))
     nb = math.sqrt(sum(v * v for v in b.values()))
     return dot / (na * nb) if na > 0 and nb > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+def _http_request_with_backoff(
+    req: urllib.request.Request,
+    timeout: int = 30,
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+) -> bytes:
+    """Execute *req* with exponential-backoff retry on HTTP 429 (Too Many Requests).
+
+    Respects the ``Retry-After`` response header when present.  Re-raises
+    immediately for any non-429 HTTP error, and re-raises the last 429 once
+    *max_retries* is exhausted.
+
+    Parameters
+    ----------
+    req:
+        Pre-built :class:`urllib.request.Request`.
+    timeout:
+        Socket timeout in seconds.
+    max_retries:
+        Maximum number of retry attempts after the first failure.
+    base_delay:
+        Base wait time in seconds; doubled on each subsequent attempt,
+        capped at 60 s.
+    """
+    delay = base_delay
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt == max_retries:
+                raise
+            retry_after = exc.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else delay
+            time.sleep(wait)
+            delay = min(delay * 2, 60.0)
+    raise RuntimeError("_http_request_with_backoff: unreachable")  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
@@ -303,8 +352,7 @@ class OpenAIEmbeddingEngine(EmbeddingEngine):
                 "Content-Type": "application/json",
             },
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
+        data = json.loads(_http_request_with_backoff(req, timeout=30).decode())
         return [item["embedding"] for item in data["data"]]
 
 
@@ -816,8 +864,7 @@ def _call_llm(
             "Content-Type": "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode())
+    data = json.loads(_http_request_with_backoff(req, timeout=60).decode())
     return data["choices"][0]["message"]["content"].strip()
 
 
@@ -1221,7 +1268,7 @@ class MSRDigitalTwinRAG:
         loader = SemanticScholarLoader()
         return loader.ingest(self, max_docs=max_docs)
 
-    def answer(self, question: str, top_k: int = 5) -> str:
+    def answer(self, question: str, top_k: int = 5, trace_id: str = "") -> str:
         """
         Answer *question* using the multi-step RAG pipeline.
 
@@ -1229,12 +1276,34 @@ class MSRDigitalTwinRAG:
         ``MSR_OPENAI_API_KEY``, nor ``MSR_USE_LOCAL_GPU=true``), returns a
         structured context summary that the caller can pass to their own LLM.
         """
+        req_id = trace_id or "no-trace-id"
+        started = time.perf_counter()
+        logger.info("[query:%s] rag.answer start top_k=%d", req_id, top_k)
+
+        t_reactor = time.perf_counter()
         reactor_context = self._fetch_reactor_context()
+        logger.info(
+            "[query:%s] stage=reactor_context elapsed_ms=%.1f",
+            req_id,
+            (time.perf_counter() - t_reactor) * 1000.0,
+        )
 
         if not self._has_llm():
+            t_search = time.perf_counter()
             chunks = self._kb.search(question, top_k=top_k)
+            logger.info(
+                "[query:%s] stage=search_no_llm chunks=%d elapsed_ms=%.1f",
+                req_id,
+                len(chunks),
+                (time.perf_counter() - t_search) * 1000.0,
+            )
             prompt = self._build_simple_prompt(
                 question, self._format_chunks(chunks), reactor_context
+            )
+            logger.info(
+                "[query:%s] rag.answer complete_no_llm total_elapsed_ms=%.1f",
+                req_id,
+                (time.perf_counter() - started) * 1000.0,
             )
             return (
                 "[No LLM configured – set MSR_GITHUB_TOKEN (GitHub Models), "
@@ -1244,6 +1313,7 @@ class MSRDigitalTwinRAG:
             )
 
         # Step 1 – decompose question into sub-queries
+        t_decompose = time.perf_counter()
         sub_queries = _decompose_query(
             question,
             api_key=self._api_key,
@@ -1251,21 +1321,46 @@ class MSRDigitalTwinRAG:
             model=self._model,
             generate_fn=self._llm_generate,
         )
+        logger.info(
+            "[query:%s] stage=decompose sub_queries=%d elapsed_ms=%.1f",
+            req_id,
+            len(sub_queries),
+            (time.perf_counter() - t_decompose) * 1000.0,
+        )
 
         # Step 2 – parallel search + sub-answer extraction
         sub_answers: list[str] = []
+        t_sub_queries = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
             futures = {
-                pool.submit(self._run_sub_query, sq, top_k): sq
+                pool.submit(self._run_sub_query, sq, top_k, req_id): sq
                 for sq in sub_queries
             }
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
                 if result:
                     sub_answers.append(result)
+        logger.info(
+            "[query:%s] stage=sub_queries answers=%d elapsed_ms=%.1f",
+            req_id,
+            len(sub_answers),
+            (time.perf_counter() - t_sub_queries) * 1000.0,
+        )
 
         # Step 3 – synthesize final answer
-        return self._synthesize(question, sub_answers, reactor_context)
+        t_synth = time.perf_counter()
+        answer = self._synthesize(question, sub_answers, reactor_context, req_id)
+        logger.info(
+            "[query:%s] stage=synthesize elapsed_ms=%.1f",
+            req_id,
+            (time.perf_counter() - t_synth) * 1000.0,
+        )
+        logger.info(
+            "[query:%s] rag.answer complete total_elapsed_ms=%.1f",
+            req_id,
+            (time.perf_counter() - started) * 1000.0,
+        )
+        return answer
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -1304,9 +1399,21 @@ class MSRDigitalTwinRAG:
                 continue
         return total
 
-    def _run_sub_query(self, sub_query: SubQuery, top_k: int) -> str:
+    def _run_sub_query(self, sub_query: SubQuery, top_k: int, trace_id: str = "") -> str:
         """Search the KB for one sub-query and return a focused partial answer."""
+        req_id = trace_id or "no-trace-id"
+        started = time.perf_counter()
+        logger.info("[query:%s] sub_query start term=%s", req_id, sub_query.term)
+
+        t_search = time.perf_counter()
         chunks = self._kb.search(sub_query.term, top_k=top_k)
+        logger.info(
+            "[query:%s] sub_query search_done term=%s chunks=%d elapsed_ms=%.1f",
+            req_id,
+            sub_query.term,
+            len(chunks),
+            (time.perf_counter() - t_search) * 1000.0,
+        )
         if not chunks:
             return ""
 
@@ -1340,10 +1447,19 @@ class MSRDigitalTwinRAG:
         ]
 
         try:
-            return self._llm_generate(
+            t_llm = time.perf_counter()
+            answer = self._llm_generate(
                 [{"role": "user", "content": "\n".join(parts)}],
                 512,
             )
+            logger.info(
+                "[query:%s] sub_query llm_done term=%s llm_elapsed_ms=%.1f total_elapsed_ms=%.1f",
+                req_id,
+                sub_query.term,
+                (time.perf_counter() - t_llm) * 1000.0,
+                (time.perf_counter() - started) * 1000.0,
+            )
+            return answer
         except Exception as exc:  # noqa: BLE001
             import sys
             print(f"[RAG] Sub-query '{sub_query.term}' LLM call failed ({exc!r}).", file=sys.stderr)
@@ -1354,8 +1470,10 @@ class MSRDigitalTwinRAG:
         question: str,
         sub_answers: list[str],
         reactor_context: str,
+        trace_id: str = "",
     ) -> str:
         """Combine sub-answers + live reactor data into a final answer."""
+        req_id = trace_id or "no-trace-id"
         findings = "\n\n".join(
             f"[Finding {i + 1}]\n{ans}"
             for i, ans in enumerate(sub_answers)
@@ -1394,6 +1512,7 @@ class MSRDigitalTwinRAG:
         """)
 
         try:
+            t_llm = time.perf_counter()
             return self._llm_generate(
                 [{"role": "user", "content": prompt}],
                 1024,
@@ -1401,6 +1520,12 @@ class MSRDigitalTwinRAG:
         except Exception as exc:  # noqa: BLE001
             import sys
             print(f"[RAG] Final synthesis LLM call failed ({exc!r}).", file=sys.stderr)
+            logger.warning(
+                "[query:%s] synthesize_failed llm_elapsed_ms=%.1f error=%s",
+                req_id,
+                (time.perf_counter() - t_llm) * 1000.0,
+                exc,
+            )
             return (
                 f"[Final synthesis failed: {exc}. Returning raw research findings below:]\n\n"
                 + findings

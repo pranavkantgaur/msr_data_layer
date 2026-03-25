@@ -96,9 +96,12 @@ See ``template.yaml`` (AWS SAM), ``Dockerfile.gpu`` (GPU container), and
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import json
 import logging
 import os
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -341,7 +344,7 @@ def _handle_mcp(raw_body: str) -> dict[str, Any]:
         return _response(200, {"raw": response_str})
 
 
-def _handle_query(body: dict[str, Any]) -> dict[str, Any]:
+def _handle_query(body: dict[str, Any], request_id: str = "") -> dict[str, Any]:
     """
     ``POST /query`` – RAG query endpoint.
 
@@ -360,22 +363,75 @@ def _handle_query(body: dict[str, Any]) -> dict[str, Any]:
           "top_k": 5
         }
     """
+    req_id = request_id or uuid.uuid4().hex[:12]
     question = body.get("question", "").strip()
     if not question:
         return _error(400, "Request body must include a non-empty 'question' field.")
     top_k = int(body.get("top_k", 5))
     top_k = max(1, min(top_k, 20))
+    include_diagnostics = bool(body.get("diagnostics") or body.get("debug"))
+
+    timeout_s = float(os.environ.get("MSR_QUERY_TIMEOUT_SECONDS", "55"))
+    timeout_s = max(5.0, timeout_s)
+
+    logger.info(
+        "[query:%s] start top_k=%d timeout_s=%.1f question_chars=%d",
+        req_id,
+        top_k,
+        timeout_s,
+        len(question),
+    )
+
     rag = _get_rag()
+    started = time.perf_counter()
     try:
-        answer = rag.answer(question, top_k=top_k)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(rag.answer, question, top_k, req_id)
+            answer = future.result(timeout=timeout_s)
+    except concurrent.futures.TimeoutError:
+        elapsed = (time.perf_counter() - started) * 1000.0
+        logger.error(
+            "[query:%s] timeout after %.1fms (gateway likely timed out first if >~60s)",
+            req_id,
+            elapsed,
+        )
+        payload: dict[str, Any] = {
+            "error": f"Query timed out after {timeout_s:.1f}s",
+            "request_id": req_id,
+            "elapsed_ms": round(elapsed, 1),
+            "hint": (
+                "RAG query exceeded the configured server timeout. "
+                "Check stage-level logs for this request_id."
+            ),
+        }
+        return _response(504, payload)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("RAG query failed")
-        return _error(500, f"RAG query failed: {exc}")
-    return _response(200, {
+        elapsed = (time.perf_counter() - started) * 1000.0
+        logger.exception("[query:%s] RAG query failed after %.1fms", req_id, elapsed)
+        payload = {
+            "error": f"RAG query failed: {exc}",
+            "request_id": req_id,
+            "elapsed_ms": round(elapsed, 1),
+        }
+        return _response(500, payload)
+
+    elapsed = (time.perf_counter() - started) * 1000.0
+    logger.info("[query:%s] success elapsed_ms=%.1f", req_id, elapsed)
+
+    response_body: dict[str, Any] = {
         "question": question,
         "answer": answer,
         "top_k": top_k,
-    })
+    }
+    if include_diagnostics:
+        response_body["diagnostics"] = {
+            "request_id": req_id,
+            "elapsed_ms": round(elapsed, 1),
+            "timeout_seconds": timeout_s,
+            "question_chars": len(question),
+            "top_k": top_k,
+        }
+    return _response(200, response_body)
 
 
 def _handle_plant_data_ingest(body: dict[str, Any]) -> dict[str, Any]:
@@ -414,7 +470,6 @@ def _handle_plant_data_ingest(body: dict[str, Any]) -> dict[str, Any]:
 
     source_id = (body.get("source_id") or "").strip()
     if not source_id:
-        import time  # noqa: PLC0415
         source_id = f"{data_type}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
 
     rag = _get_rag()
@@ -543,8 +598,7 @@ def _handle_timeseries_ingest(body: dict[str, Any]) -> dict[str, Any]:
 
     source_id: str = body.get("source_id", "")
     if not source_id:
-        import time as _time  # noqa: PLC0415
-        source_id = f"timeseries-{_time.strftime('%Y%m%dT%H%M%SZ', _time.gmtime())}"
+        source_id = f"timeseries-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
     data_type: str = body.get("data_type", "sensor_snapshot")
     also_ingest_text: bool = bool(body.get("also_ingest_text", True))
 
@@ -651,6 +705,14 @@ def _route_http(event: dict[str, Any]) -> dict[str, Any]:
         return _error(403, "Forbidden: invalid or missing X-Api-Key header.")
 
     raw_body, parsed_body = _parse_body(event)
+    headers = event.get("headers") or {}
+    request_id = (
+        headers.get("x-request-id")
+        or headers.get("X-Request-Id")
+        or headers.get("x-correlation-id")
+        or headers.get("X-Correlation-Id")
+        or uuid.uuid4().hex[:12]
+    )
 
     # Health / root
     if path in ("/health", "/") and method == "GET":
@@ -662,7 +724,7 @@ def _route_http(event: dict[str, Any]) -> dict[str, Any]:
 
     # RAG query endpoint
     if path == "/query" and method == "POST":
-        return _handle_query(parsed_body)
+        return _handle_query(parsed_body, request_id=request_id)
 
     # KB update endpoint
     if path == "/kb/update" and method == "POST":
