@@ -28,8 +28,9 @@ Read tools (always present):
 - ``get_sensor_reading``   – latest value of a named sensor
 - ``get_all_sensor_readings`` – all sensor values at once
 - ``get_sensor_history``   – recent history for a sensor (in-memory ring buffer)
-- ``get_active_alarms``    – active safety/operational alarms
+- ``get_active_alarms``    – active safety/operational alarms (in-memory, current session)
 - ``get_data_source_info`` – data source connectivity and configuration
+- ``get_alarm_history``    – persistent alarm audit log (SQLite, survives restarts)
 
 Timeseries tools (structured numerical queries over SQLite store):
 - ``query_sensor_timeseries``   – time-range or latest-N rows for a sensor
@@ -457,6 +458,59 @@ def ingest_full_paper_text(
         return {"success": False, "source_id": source_id, "error": str(exc)}
 
 
+def get_alarm_history(
+    start_time: str = "",
+    end_time: str = "",
+    severity: str = "",
+    sensor: str = "",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """
+    Query the persistent alarm history store.
+
+    Returns alarm events recorded since the server was first deployed,
+    including events from previous server sessions.  Alarms are written
+    to the SQLite ``alarm_history`` table every time a threshold is
+    exceeded; this endpoint provides read-only access for audit and
+    regulatory-traceability purposes.
+
+    Parameters
+    ----------
+    start_time : str
+        ISO 8601 lower bound (inclusive), e.g. ``"2024-01-15T00:00:00Z"``.
+        Omit for no lower bound.
+    end_time : str
+        ISO 8601 upper bound (inclusive).  Omit for no upper bound.
+    severity : str
+        Filter by severity level: ``"WARNING"`` or ``"CRITICAL"``.
+        Omit to return all severities.
+    sensor : str
+        Filter to a specific sensor name, e.g. ``"core_temperature_c"``.
+        Omit to return alarms for all sensors.
+    limit : int
+        Maximum number of events to return (1–1000, default 100).
+        Results are ordered newest-first.
+    """
+    try:
+        from msr_kb_sources import AlarmHistoryStore  # noqa: PLC0415
+
+        store = AlarmHistoryStore()
+        alarms = store.query_history(
+            start=start_time or None,
+            end=end_time or None,
+            severity=severity or None,
+            sensor=sensor or None,
+            limit=limit,
+        )
+        return {
+            "alarm_count": len(alarms),
+            "alarms": alarms,
+            "data_source": "alarm-history-sqlite",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc), "alarm_count": 0, "alarms": []}
+
+
 # ---------------------------------------------------------------------------
 # MCP tool registry
 # ---------------------------------------------------------------------------
@@ -668,6 +722,48 @@ TOOLS: list[dict[str, Any]] = [
         },
         "handler": ingest_full_paper_text,
     },
+    {
+        "name": "get_alarm_history",
+        "description": (
+            "Query the persistent alarm history store for recorded alarm events. "
+            "Unlike get_active_alarms (which returns only the current in-memory state), "
+            "this tool returns alarm events persisted across all server sessions, "
+            "providing a full audit trail for regulatory-traceability purposes. "
+            "Supports time-range, severity, and sensor filters."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start_time": {
+                    "type": "string",
+                    "description": "ISO 8601 lower bound (inclusive), e.g. '2024-01-15T00:00:00Z'. Omit for no lower bound.",
+                    "default": "",
+                },
+                "end_time": {
+                    "type": "string",
+                    "description": "ISO 8601 upper bound (inclusive). Omit for no upper bound.",
+                    "default": "",
+                },
+                "severity": {
+                    "type": "string",
+                    "description": "Filter by severity: 'WARNING' or 'CRITICAL'. Omit for all severities.",
+                    "default": "",
+                },
+                "sensor": {
+                    "type": "string",
+                    "description": "Filter to a specific sensor, e.g. 'core_temperature_c'. Omit for all sensors.",
+                    "default": "",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum events to return (1–1000, default 100). Ordered newest-first.",
+                    "default": 100,
+                },
+            },
+            "required": [],
+        },
+        "handler": get_alarm_history,
+    },
 ]
 
 TOOL_MAP: dict[str, dict[str, Any]] = {t["name"]: t for t in TOOLS}
@@ -788,14 +884,19 @@ def _check_alarms() -> None:
         value = state.get(sensor, 0)
         triggered = (high is not None and value > high) or (low is not None and value < low)
         if triggered and alarm_id not in existing_ids:
-            _ALARMS.append(
-                {
-                    "alarm_id": alarm_id,
-                    "sensor": sensor,
-                    "value": value,
-                    "threshold_high": high,
-                    "threshold_low": low,
-                    "severity": "WARNING",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            )
+            alarm: dict[str, Any] = {
+                "alarm_id": alarm_id,
+                "sensor": sensor,
+                "value": value,
+                "threshold_high": high,
+                "threshold_low": low,
+                "severity": "WARNING",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            _ALARMS.append(alarm)
+            # Persist to the alarm history store for audit-trail compliance.
+            try:
+                from msr_kb_sources import AlarmHistoryStore  # noqa: PLC0415
+                AlarmHistoryStore().record_alarm(alarm)
+            except Exception:  # noqa: BLE001
+                pass  # never let persistence errors suppress alarm reporting

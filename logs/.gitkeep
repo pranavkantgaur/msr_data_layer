@@ -1,0 +1,3 @@
+# This file is a placeholder to ensure the logs/ directory is tracked by git.
+# Actual log files (*.log, executed_notebook.ipynb, proposed_fix.patch) are
+# excluded by .gitignore and auto-generated at runtime.

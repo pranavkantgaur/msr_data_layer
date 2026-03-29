@@ -1475,3 +1475,156 @@ def test_s2_format_paper_text_abstract_only_prefix():
     assert "ABSTRACT ONLY" in text
     assert "ingest_full_paper_text" in text
     assert source_id == "s2:abc123"
+
+
+# ---------------------------------------------------------------------------
+# AlarmHistoryStore tests
+# ---------------------------------------------------------------------------
+
+class TestAlarmHistoryStore:
+    """Unit tests for AlarmHistoryStore."""
+
+    def _sample_alarm(self, alarm_id: str = "CORE_TEMP_HIGH") -> dict:
+        return {
+            "alarm_id": alarm_id,
+            "sensor": "core_temperature_c",
+            "value": 752.3,
+            "threshold_high": 750.0,
+            "threshold_low": None,
+            "severity": "WARNING",
+            "timestamp": "2024-01-15T14:32:00Z",
+        }
+
+    def test_init_creates_db(self, tmp_path):
+        from msr_kb_sources import AlarmHistoryStore
+        AlarmHistoryStore(kb_dir=tmp_path)
+        assert (tmp_path / "plant_timeseries.db").exists()
+
+    def test_record_and_query(self, tmp_path):
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        store.record_alarm(self._sample_alarm())
+        rows = store.query_history()
+        assert len(rows) == 1
+        assert rows[0]["alarm_id"] == "CORE_TEMP_HIGH"
+        assert rows[0]["sensor"] == "core_temperature_c"
+        assert rows[0]["value"] == 752.3
+        assert rows[0]["severity"] == "WARNING"
+
+    def test_multiple_alarms(self, tmp_path):
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        store.record_alarm(self._sample_alarm("CORE_TEMP_HIGH"))
+        store.record_alarm({
+            "alarm_id": "POWER_HIGH",
+            "sensor": "reactor_power_mw",
+            "value": 112.0,
+            "threshold_high": 110.0,
+            "threshold_low": None,
+            "severity": "WARNING",
+            "timestamp": "2024-01-15T15:00:00Z",
+        })
+        rows = store.query_history()
+        assert len(rows) == 2
+
+    def test_get_alarm_count(self, tmp_path):
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        assert store.get_alarm_count() == 0
+        store.record_alarm(self._sample_alarm())
+        assert store.get_alarm_count() == 1
+        store.record_alarm(self._sample_alarm("POWER_HIGH"))
+        assert store.get_alarm_count() == 2
+
+    def test_query_filter_by_severity(self, tmp_path):
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        store.record_alarm(self._sample_alarm("ALARM_A"))
+        store.record_alarm({
+            **self._sample_alarm("ALARM_B"),
+            "severity": "CRITICAL",
+        })
+        warnings = store.query_history(severity="WARNING")
+        assert len(warnings) == 1
+        assert warnings[0]["alarm_id"] == "ALARM_A"
+        criticals = store.query_history(severity="CRITICAL")
+        assert len(criticals) == 1
+        assert criticals[0]["alarm_id"] == "ALARM_B"
+
+    def test_query_filter_by_sensor(self, tmp_path):
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        store.record_alarm(self._sample_alarm())
+        store.record_alarm({
+            "alarm_id": "POWER_HIGH",
+            "sensor": "reactor_power_mw",
+            "value": 112.0,
+            "threshold_high": 110.0,
+            "threshold_low": None,
+            "severity": "WARNING",
+            "timestamp": "2024-01-15T15:00:00Z",
+        })
+        rows = store.query_history(sensor="reactor_power_mw")
+        assert len(rows) == 1
+        assert rows[0]["alarm_id"] == "POWER_HIGH"
+
+    def test_query_filter_by_time_range(self, tmp_path):
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        store.record_alarm({**self._sample_alarm(), "timestamp": "2024-01-14T12:00:00Z"})
+        store.record_alarm({**self._sample_alarm("POWER_HIGH"), "timestamp": "2024-01-15T12:00:00Z"})
+        store.record_alarm({**self._sample_alarm("FUEL_LOW"), "timestamp": "2024-01-16T12:00:00Z"})
+        rows = store.query_history(
+            start="2024-01-15T00:00:00Z",
+            end="2024-01-15T23:59:59Z",
+        )
+        assert len(rows) == 1
+        assert rows[0]["alarm_id"] == "POWER_HIGH"
+
+    def test_query_limit(self, tmp_path):
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        for i in range(5):
+            store.record_alarm({**self._sample_alarm(f"ALARM_{i}"),
+                                 "timestamp": f"2024-01-15T1{i}:00:00Z"})
+        rows = store.query_history(limit=3)
+        assert len(rows) == 3
+
+    def test_query_ordered_newest_first(self, tmp_path):
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        store.record_alarm({**self._sample_alarm("OLD"), "timestamp": "2024-01-14T12:00:00Z"})
+        store.record_alarm({**self._sample_alarm("NEW"), "timestamp": "2024-01-15T12:00:00Z"})
+        rows = store.query_history()
+        assert rows[0]["alarm_id"] == "NEW"
+        assert rows[1]["alarm_id"] == "OLD"
+
+    def test_shares_db_with_timeseries_store(self, tmp_path):
+        """AlarmHistoryStore and TimeseriesStore both use plant_timeseries.db."""
+        from msr_kb_sources import AlarmHistoryStore, TimeseriesStore
+        ts = TimeseriesStore(kb_dir=tmp_path)
+        ts.insert_readings(
+            [{"sensor_name": "reactor_power_mw", "value": 99.0,
+              "timestamp": "2024-01-15T12:00:00Z"}],
+            source_id="src-001",
+        )
+        alarm_store = AlarmHistoryStore(kb_dir=tmp_path)
+        alarm_store.record_alarm(self._sample_alarm())
+        # Both files are the same db
+        assert (tmp_path / "plant_timeseries.db").exists()
+        assert alarm_store.get_alarm_count() == 1
+        assert ts._count_readings() == 1
+
+    def test_record_alarm_severity_uppercased(self, tmp_path):
+        """severity is stored in uppercase regardless of input case."""
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        store.record_alarm({**self._sample_alarm(), "severity": "warning"})
+        rows = store.query_history()
+        assert rows[0]["severity"] == "WARNING"
+
+    def test_query_empty_store(self, tmp_path):
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        rows = store.query_history()
+        assert rows == []

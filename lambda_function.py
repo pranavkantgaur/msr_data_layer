@@ -31,7 +31,12 @@ handles all four concerns:
    ``{readings: [...], source_id, data_type}`` and inserts timestamped sensor
    readings into the SQLite timeseries store (and optionally the RAG KB).
 
-7. **Health endpoint** (``GET /health``) – returns 200 with service metadata
+7. **Alarm history endpoint** (``GET /alarms/history``) – returns the
+   persistent alarm event log from the SQLite ``alarm_history`` table.
+   Supports optional query-string filters: ``start_time``, ``end_time``,
+   ``severity``, ``sensor``, ``limit``.
+
+8. **Health endpoint** (``GET /health``) – returns 200 with service metadata
    for load-balancer checks and uptime monitoring.
 
 Knowledge Base Persistence
@@ -685,6 +690,48 @@ def _handle_timeseries_query(body: dict[str, Any]) -> dict[str, Any]:
         return _error(500, f"Query failed: {exc}")
 
 
+def _handle_alarm_history(params: dict[str, str]) -> dict[str, Any]:
+    """
+    ``GET /alarms/history`` – query the persistent alarm history store.
+
+    Accepts optional query-string parameters:
+
+    * ``start_time`` – ISO 8601 lower bound (inclusive)
+    * ``end_time``   – ISO 8601 upper bound (inclusive)
+    * ``severity``   – ``WARNING`` or ``CRITICAL``
+    * ``sensor``     – sensor name filter
+    * ``limit``      – max rows (1–1000, default 100)
+
+    Example::
+
+        GET /alarms/history?severity=WARNING&limit=50
+    """
+    try:
+        from msr_kb_sources import AlarmHistoryStore  # noqa: PLC0415
+
+        store = AlarmHistoryStore()
+        limit_raw = params.get("limit", "100")
+        try:
+            limit = int(limit_raw)
+        except (ValueError, TypeError):
+            limit = 100
+        alarms = store.query_history(
+            start=params.get("start_time") or None,
+            end=params.get("end_time") or None,
+            severity=params.get("severity") or None,
+            sensor=params.get("sensor") or None,
+            limit=limit,
+        )
+        return _response(200, {
+            "alarm_count": len(alarms),
+            "alarms": alarms,
+            "data_source": "alarm-history-sqlite",
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Alarm history query failed")
+        return _error(500, f"Query failed: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # API Gateway event router
 # ---------------------------------------------------------------------------
@@ -741,6 +788,22 @@ def _route_http(event: dict[str, Any]) -> dict[str, Any]:
     # Timeseries query endpoint
     if path == "/timeseries/query" and method == "POST":
         return _handle_timeseries_query(parsed_body)
+
+    # Alarm history endpoint
+    if path == "/alarms/history" and method == "GET":
+        # Extract query string params (API Gateway v1: queryStringParameters;
+        # v2: rawQueryString as "key=val&key2=val2")
+        qs_params: dict[str, str] = {}
+        qs_v1 = event.get("queryStringParameters") or {}
+        if qs_v1:
+            qs_params.update({k: v for k, v in qs_v1.items() if isinstance(v, str)})
+        raw_qs = event.get("rawQueryString", "")
+        if raw_qs and not qs_params:
+            for pair in raw_qs.split("&"):
+                if "=" in pair:
+                    k, _, v = pair.partition("=")
+                    qs_params[k] = v
+        return _handle_alarm_history(qs_params)
 
     return _error(404, f"Not found: {method} {path}")
 

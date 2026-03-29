@@ -21,8 +21,10 @@
     }
   },
 
-  // Install Python dependencies on container creation
-  "postCreateCommand": "pip install --quiet -r requirements_mcp.txt",
+  // Install Python dependencies and Jupyter on container creation.
+  // jupyter + nbconvert are needed to execute the demo notebook interactively
+  // or via `python scripts/run_notebook.py` from within the Codespace.
+  "postCreateCommand": "pip install --quiet -r requirements_mcp.txt && pip install --quiet jupyter nbconvert ipykernel",
 
   // Start the HTTP server when the Codespace session begins.
   // Uses .devcontainer/start-server.sh which calls nohup so the process
