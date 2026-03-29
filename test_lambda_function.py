@@ -857,3 +857,112 @@ class TestTimeseriesEndpoints:
              patch("lambda_function._get_rag", return_value=mock_rag):
             resp = lf._route_http(event)
         assert resp["statusCode"] == 200
+
+
+class TestAlarmHistoryEndpoint:
+    """Tests for GET /alarms/history lambda handler."""
+
+    def test_alarm_history_empty(self, monkeypatch, tmp_path):
+        """GET /alarms/history returns empty list when no alarms recorded."""
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+        import lambda_function as lf
+        resp = lf._handle_alarm_history({})
+        import json
+        data = json.loads(resp["body"])
+        assert resp["statusCode"] == 200
+        assert data["alarm_count"] == 0
+        assert data["alarms"] == []
+        assert data["data_source"] == "alarm-history-sqlite"
+
+    def test_alarm_history_with_data(self, monkeypatch, tmp_path):
+        """GET /alarms/history returns recorded alarm events."""
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        store.record_alarm({
+            "alarm_id": "CORE_TEMP_HIGH",
+            "sensor": "core_temperature_c",
+            "value": 752.3,
+            "threshold_high": 750.0,
+            "threshold_low": None,
+            "severity": "WARNING",
+            "timestamp": "2024-01-15T14:32:00Z",
+        })
+        import lambda_function as lf
+        import json
+        resp = lf._handle_alarm_history({})
+        data = json.loads(resp["body"])
+        assert resp["statusCode"] == 200
+        assert data["alarm_count"] == 1
+        assert data["alarms"][0]["alarm_id"] == "CORE_TEMP_HIGH"
+
+    def test_alarm_history_severity_filter(self, monkeypatch, tmp_path):
+        """GET /alarms/history?severity=WARNING filters by severity."""
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        store.record_alarm({
+            "alarm_id": "ALARM_W", "sensor": "core_temperature_c",
+            "value": 752.0, "threshold_high": 750.0, "threshold_low": None,
+            "severity": "WARNING", "timestamp": "2024-01-15T14:00:00Z",
+        })
+        store.record_alarm({
+            "alarm_id": "ALARM_C", "sensor": "core_temperature_c",
+            "value": 800.0, "threshold_high": 750.0, "threshold_low": None,
+            "severity": "CRITICAL", "timestamp": "2024-01-15T15:00:00Z",
+        })
+        import lambda_function as lf
+        import json
+        resp = lf._handle_alarm_history({"severity": "WARNING"})
+        data = json.loads(resp["body"])
+        assert resp["statusCode"] == 200
+        assert data["alarm_count"] == 1
+        assert data["alarms"][0]["alarm_id"] == "ALARM_W"
+
+    def test_alarm_history_limit_param(self, monkeypatch, tmp_path):
+        """GET /alarms/history?limit=2 caps result count."""
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+        from msr_kb_sources import AlarmHistoryStore
+        store = AlarmHistoryStore(kb_dir=tmp_path)
+        for i in range(4):
+            store.record_alarm({
+                "alarm_id": f"ALARM_{i}", "sensor": "core_temperature_c",
+                "value": 752.0, "threshold_high": 750.0, "threshold_low": None,
+                "severity": "WARNING", "timestamp": f"2024-01-15T1{i}:00:00Z",
+            })
+        import lambda_function as lf
+        import json
+        resp = lf._handle_alarm_history({"limit": "2"})
+        data = json.loads(resp["body"])
+        assert resp["statusCode"] == 200
+        assert data["alarm_count"] == 2
+
+    def test_alarm_history_invalid_limit_defaults(self, monkeypatch, tmp_path):
+        """Non-numeric limit param defaults to 100."""
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+        import lambda_function as lf
+        import json
+        resp = lf._handle_alarm_history({"limit": "invalid"})
+        data = json.loads(resp["body"])
+        assert resp["statusCode"] == 200
+        assert data["alarm_count"] == 0  # empty store
+
+    def test_alarm_history_route_dispatched(self, monkeypatch, tmp_path):
+        """_route_http dispatches GET /alarms/history correctly."""
+        monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+        import lambda_function as lf
+        import json
+        from unittest.mock import patch
+        event = {
+            "requestContext": {"http": {"method": "GET"}},
+            "rawPath": "/alarms/history",
+            "queryStringParameters": {"limit": "10"},
+            "body": None,
+            "isBase64Encoded": False,
+            "headers": {},
+        }
+        with patch("lambda_function._is_authenticated", return_value=True):
+            resp = lf._route_http(event)
+        assert resp["statusCode"] == 200
+        data = json.loads(resp["body"])
+        assert "alarm_count" in data

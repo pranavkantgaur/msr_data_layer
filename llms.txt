@@ -14,8 +14,10 @@ and ingest MSR data without writing custom integrations.
 
 - **Read tools:** `get_reactor_status`, `get_sensor_reading`,
   `get_all_sensor_readings`, `get_sensor_history`, `get_active_alarms`,
-  `get_data_source_info`
-- **Write tools:** `ingest_plant_data`
+  `get_data_source_info`, `get_alarm_history`
+- **Timeseries tools:** `query_sensor_timeseries`, `get_sensor_stats`,
+  `query_plant_data_nl`
+- **Write tools:** `ingest_plant_data`, `ingest_full_paper_text`
 - **RAG pipeline:** multi-step decompose → parallel hybrid search → synthesise
 - **Deployment:** AWS Lambda + API Gateway via SAM; also runs locally as an
   MCP stdio server or HTTP server

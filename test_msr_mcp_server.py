@@ -10,6 +10,7 @@ from msr_mcp_server import (
     get_sensor_history,
     get_active_alarms,
     get_data_source_info,
+    get_alarm_history,
     ingest_plant_data,
     TOOLS,
     TOOL_MAP,
@@ -47,6 +48,7 @@ def test_tools_list():
         "get_sensor_stats",
         "query_plant_data_nl",
         "ingest_full_paper_text",
+        "get_alarm_history",
     }
     assert expected == names
 
@@ -351,3 +353,127 @@ def test_ingest_full_paper_text_success(tmp_path, monkeypatch):
     assert result["source_id"] == "arxiv:2401.12345"
     assert result["full_source_id"] == "full:arxiv:2401.12345"
     assert result["chunks_added"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# get_alarm_history tests
+# ---------------------------------------------------------------------------
+
+def test_get_alarm_history_empty_store(tmp_path, monkeypatch):
+    """get_alarm_history returns empty list when no alarms have been recorded."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    result = get_alarm_history()
+    assert "alarm_count" in result
+    assert "alarms" in result
+    assert result["alarm_count"] == 0
+    assert result["alarms"] == []
+    assert result["data_source"] == "alarm-history-sqlite"
+
+
+def test_get_alarm_history_with_data(tmp_path, monkeypatch):
+    """get_alarm_history returns previously recorded alarms."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    from msr_kb_sources import AlarmHistoryStore
+    store = AlarmHistoryStore(kb_dir=tmp_path)
+    store.record_alarm({
+        "alarm_id": "CORE_TEMP_HIGH",
+        "sensor": "core_temperature_c",
+        "value": 752.3,
+        "threshold_high": 750.0,
+        "threshold_low": None,
+        "severity": "WARNING",
+        "timestamp": "2024-01-15T14:32:00Z",
+    })
+    result = get_alarm_history()
+    assert result["alarm_count"] == 1
+    assert result["alarms"][0]["alarm_id"] == "CORE_TEMP_HIGH"
+
+
+def test_get_alarm_history_filter_by_severity(tmp_path, monkeypatch):
+    """get_alarm_history severity filter returns only matching rows."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    from msr_kb_sources import AlarmHistoryStore
+    store = AlarmHistoryStore(kb_dir=tmp_path)
+    store.record_alarm({
+        "alarm_id": "ALARM_W",
+        "sensor": "core_temperature_c",
+        "value": 752.0,
+        "threshold_high": 750.0,
+        "threshold_low": None,
+        "severity": "WARNING",
+        "timestamp": "2024-01-15T14:00:00Z",
+    })
+    store.record_alarm({
+        "alarm_id": "ALARM_C",
+        "sensor": "core_temperature_c",
+        "value": 800.0,
+        "threshold_high": 750.0,
+        "threshold_low": None,
+        "severity": "CRITICAL",
+        "timestamp": "2024-01-15T15:00:00Z",
+    })
+    result = get_alarm_history(severity="WARNING")
+    assert result["alarm_count"] == 1
+    assert result["alarms"][0]["alarm_id"] == "ALARM_W"
+
+
+def test_get_alarm_history_filter_by_sensor(tmp_path, monkeypatch):
+    """get_alarm_history sensor filter returns only matching rows."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    from msr_kb_sources import AlarmHistoryStore
+    store = AlarmHistoryStore(kb_dir=tmp_path)
+    store.record_alarm({
+        "alarm_id": "CORE_TEMP_HIGH",
+        "sensor": "core_temperature_c",
+        "value": 752.0,
+        "threshold_high": 750.0,
+        "threshold_low": None,
+        "severity": "WARNING",
+        "timestamp": "2024-01-15T14:00:00Z",
+    })
+    store.record_alarm({
+        "alarm_id": "POWER_HIGH",
+        "sensor": "reactor_power_mw",
+        "value": 115.0,
+        "threshold_high": 110.0,
+        "threshold_low": None,
+        "severity": "WARNING",
+        "timestamp": "2024-01-15T14:05:00Z",
+    })
+    result = get_alarm_history(sensor="reactor_power_mw")
+    assert result["alarm_count"] == 1
+    assert result["alarms"][0]["alarm_id"] == "POWER_HIGH"
+
+
+def test_get_alarm_history_limit(tmp_path, monkeypatch):
+    """get_alarm_history limit parameter caps the number of rows returned."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    from msr_kb_sources import AlarmHistoryStore
+    store = AlarmHistoryStore(kb_dir=tmp_path)
+    for i in range(5):
+        store.record_alarm({
+            "alarm_id": f"ALARM_{i}",
+            "sensor": "core_temperature_c",
+            "value": 752.0,
+            "threshold_high": 750.0,
+            "threshold_low": None,
+            "severity": "WARNING",
+            "timestamp": f"2024-01-15T1{i}:00:00Z",
+        })
+    result = get_alarm_history(limit=3)
+    assert result["alarm_count"] == 3
+
+
+def test_get_alarm_history_in_tools_registry():
+    """get_alarm_history is present in the TOOLS list."""
+    names = [t["name"] for t in TOOLS]
+    assert "get_alarm_history" in names
+
+
+def test_get_alarm_history_via_mcp(tmp_path, monkeypatch):
+    """get_alarm_history is callable via MCP tools/call."""
+    monkeypatch.setenv("MSR_KB_DIR", str(tmp_path))
+    resp = _call("tools/call", {"name": "get_alarm_history", "arguments": {}})
+    result = json.loads(resp["result"]["content"][0]["text"])
+    assert "alarm_count" in result
+    assert "alarms" in result

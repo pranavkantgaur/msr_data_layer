@@ -51,6 +51,7 @@ structural changes.
                                │   get_sensor_history              │
                                │   get_active_alarms               │
                                │   get_data_source_info            │
+                               │   get_alarm_history               │
                                │                                   │
                                │  Timeseries tools (SQLite):       │
                                │   query_sensor_timeseries         │
@@ -114,6 +115,11 @@ Document loaders and data stores that populate the KB:
   supports time-range queries, aggregate statistics, and NL→SQL via
   `execute_safe_select()` + `get_schema_description()`;
   state persisted in `timeseries_state.json`
+- `AlarmHistoryStore` — **SQLite-backed alarm audit log** (`sqlite3` stdlib);
+  append-only table `alarm_history(id, alarm_id, sensor, value, threshold_high, threshold_low, severity, timestamp, inserted_at)`;
+  stores every alarm onset in the same `plant_timeseries.db` database; supports time-range,
+  severity, and sensor filters; exposed via `get_alarm_history` MCP tool and `GET /alarms/history`
+  HTTP endpoint for IEC 62645 / IAEA regulatory-traceability compliance
 - `KBSourceManager.ingest_full_paper_text(source_id, markdown_text)` — user-initiated
   full-text ingestion; stores under `full:<source_id>` alongside existing abstract chunks
 
@@ -140,6 +146,7 @@ HTTP router used by both `server.py` (primary) and AWS Lambda (optional). Routes
 - `POST /data/ingest` → plant data ingest (text / event logs)
 - `POST /timeseries/ingest` → ingest timestamped sensor readings
 - `POST /timeseries/query` → structured or NL query against `TimeseriesStore`
+- `GET /alarms/history` → query `AlarmHistoryStore` (supports `start_time`, `end_time`, `severity`, `sensor`, `limit` query params)
 
 ### `msr_digital_twin_client.py`
 Python client that wraps the MCP server tools as Python methods. Used for
