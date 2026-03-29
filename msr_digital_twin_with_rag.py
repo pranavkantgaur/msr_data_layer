@@ -338,7 +338,16 @@ class OpenAIEmbeddingEngine(EmbeddingEngine):
     when the API endpoint is unreachable (e.g. DNS failure, network sandbox,
     or offline environment).  Once a network error is detected all subsequent
     calls use the same fallback engine so that embedding dimensions are
-    consistent across ingestion and retrieval.
+    consistent **within the current server session**.
+
+    .. note::
+       If the knowledge base was previously built with OpenAI embeddings
+       (e.g. from a Codespace session) and the server is later started in an
+       offline environment that triggers the fallback, cosine-similarity
+       scores between old (OpenAI) and new (random-projection) embeddings
+       will be meaningless.  The KB should be rebuilt when switching engines.
+       In practice this only matters when the persistent ``kb_store`` is
+       reused across environments with different API availability.
     """
 
     def __init__(self, api_key: str, base_url: str, model: str) -> None:
@@ -1322,19 +1331,20 @@ class MSRDigitalTwinRAG:
                 len(chunks),
                 (time.perf_counter() - t_search) * 1000.0,
             )
-            prompt = self._build_simple_prompt(
-                question, self._format_chunks(chunks), reactor_context
-            )
+            doc_context = self._format_chunks(chunks)
             logger.info(
                 "[query:%s] rag.answer complete_no_llm total_elapsed_ms=%.1f",
                 req_id,
                 (time.perf_counter() - started) * 1000.0,
             )
+            # Return the retrieved context directly so the caller sees useful content.
+            # Add a short notice so users know to enable an LLM for synthesized answers.
             return (
-                "[No LLM configured – set MSR_GITHUB_TOKEN (GitHub Models), "
-                "MSR_OPENAI_API_KEY, or "
-                "MSR_USE_LOCAL_GPU=true to enable generation]\n\n"
-                + prompt
+                "[No LLM configured – set MSR_GITHUB_TOKEN (GitHub Codespaces/Models), "
+                "MSR_OPENAI_API_KEY, or MSR_USE_LOCAL_GPU=true for synthesized answers.]\n\n"
+                f"Live plant data:\n{reactor_context}\n\n"
+                "Retrieved knowledge-base passages:\n\n"
+                + doc_context
             )
 
         # Step 1 – decompose question into sub-queries
@@ -1488,7 +1498,9 @@ class MSRDigitalTwinRAG:
         except Exception as exc:  # noqa: BLE001
             import sys
             print(f"[RAG] Sub-query '{sub_query.term}' LLM call failed ({exc!r}).", file=sys.stderr)
-            return f"[Sub-query search error: {exc}]"
+            # Fall back to returning the retrieved document context directly so the
+            # synthesis step (and ultimately the user) still sees relevant content.
+            return doc_context
 
     def _synthesize(
         self,
@@ -1551,8 +1563,12 @@ class MSRDigitalTwinRAG:
                 (time.perf_counter() - t_llm) * 1000.0,
                 exc,
             )
+            # When the LLM is unreachable, return a formatted summary of the
+            # retrieved knowledge-base context so the caller sees real content
+            # rather than error messages.
             return (
-                f"[Final synthesis failed: {exc}. Returning raw research findings below:]\n\n"
+                "The following information was retrieved from the knowledge base "
+                "(LLM synthesis unavailable):\n\n"
                 + findings
             )
 

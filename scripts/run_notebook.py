@@ -54,11 +54,19 @@ TIMEOUT = int(os.environ.get("NOTEBOOK_TIMEOUT", "300"))
 RETRIES = int(os.environ.get("NOTEBOOK_RETRIES", "2"))
 SERVER_READY_TIMEOUT = int(os.environ.get("SERVER_READY_TIMEOUT", "60"))
 
+
+def _is_localhost(url: str) -> bool:
+    """Return True when *url* targets the local machine."""
+    from urllib.parse import urlparse  # noqa: PLC0415
+    host = urlparse(url).hostname or ""
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
 # Auto-start the server only when targeting localhost
-_autostart_default = BASE_URL.startswith("http://localhost") or BASE_URL.startswith("http://127.0.0.1")
-AUTOSTART_SERVER = os.environ.get("MSR_AUTOSTART_SERVER", "true" if _autostart_default else "false").lower() not in (
-    "false", "0", "no"
-)
+_autostart_default = _is_localhost(BASE_URL)
+AUTOSTART_SERVER = os.environ.get(
+    "MSR_AUTOSTART_SERVER", "true" if _autostart_default else "false"
+).lower() not in ("false", "0", "no")
 
 
 # ---------------------------------------------------------------------------
