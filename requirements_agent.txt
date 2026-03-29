@@ -1,0 +1,18 @@
+# MSR Agent Loop – additional Python dependencies
+#
+# These packages are used exclusively by the scripts/ agent loop and are
+# NOT required to run the core MCP server or RAG pipeline.
+#
+# Install with:
+#   pip install -r requirements_agent.txt
+
+# Jupyter notebook execution
+nbformat>=5.9.0
+nbconvert>=7.0.0
+
+# HTTP requests (for health_check.py smoke-tests that use the requests library
+# as an alternative to urllib; core health_check.py uses stdlib urllib only)
+requests>=2.28.0
+
+# WhatsApp notifications via Twilio (notifier.py)
+twilio>=8.0.0

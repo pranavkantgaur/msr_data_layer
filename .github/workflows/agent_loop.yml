@@ -1,0 +1,111 @@
+name: MSR Autonomous Agent Loop
+
+# Runs every 30 minutes, or on manual trigger
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "MSR server base URL (leave blank to skip live endpoint checks)"
+        required: false
+        default: ""
+
+jobs:
+  agent-loop:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write        # to push auto-fix branches
+      pull-requests: write   # to open PRs via gh CLI
+
+    env:
+      # LLM backend — mirrors the repo's priority order
+      MSR_OPENAI_API_KEY: ${{ secrets.MSR_OPENAI_API_KEY }}
+      MSR_GITHUB_TOKEN: ${{ secrets.MSR_GITHUB_TOKEN || github.token }}
+      MSR_OPENAI_MODEL: ${{ secrets.MSR_OPENAI_MODEL || 'gpt-4o-mini' }}
+      # Plant data server (empty = skip live endpoint checks)
+      MSR_BASE_URL: ${{ inputs.base_url || '' }}
+      MSR_API_KEY: ${{ secrets.MSR_API_KEY }}
+      # Notifications
+      EMAIL_USER: ${{ secrets.EMAIL_USER }}
+      EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      TWILIO_SID: ${{ secrets.TWILIO_SID }}
+      TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
+      WHATSAPP_TO: ${{ secrets.WHATSAPP_TO }}
+      # GitHub context for fix_agent.py + notifier.py
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+
+    steps:
+      # ----------------------------------------------------------------
+      # 1. Checkout
+      # ----------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Use a PAT so the auto-fix branch push can trigger checks
+          token: ${{ github.token }}
+
+      # ----------------------------------------------------------------
+      # 2. Python setup
+      # ----------------------------------------------------------------
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # ----------------------------------------------------------------
+      # 3. Install dependencies
+      # ----------------------------------------------------------------
+      - name: Install core dependencies
+        run: pip install -r requirements_mcp.txt
+
+      - name: Install agent dependencies
+        run: pip install -r requirements_agent.txt
+
+      # ----------------------------------------------------------------
+      # 4. Run the demo notebook
+      # ----------------------------------------------------------------
+      - name: Run demo notebook
+        id: notebook
+        run: python scripts/run_notebook.py
+        env:
+          # KB directory inside the runner workspace (ephemeral is fine for smoke tests)
+          MSR_KB_DIR: /tmp/kb_store
+          NOTEBOOK_TIMEOUT: "120"
+          NOTEBOOK_RETRIES: "2"
+        continue-on-error: true   # allow subsequent steps even on failure
+
+      # ----------------------------------------------------------------
+      # 5. Health check (only when a server URL is configured)
+      # ----------------------------------------------------------------
+      - name: Health check
+        id: health
+        if: env.MSR_BASE_URL != ''
+        run: python scripts/health_check.py
+        continue-on-error: true
+
+      # ----------------------------------------------------------------
+      # 6. Run fix agent (only on failure of previous steps)
+      # ----------------------------------------------------------------
+      - name: Run fix agent
+        if: steps.notebook.outcome == 'failure' || steps.health.outcome == 'failure'
+        run: python scripts/fix_agent.py
+        env:
+          GIT_AUTHOR_NAME: "MSR Auto-Fix Agent"
+          GIT_AUTHOR_EMAIL: "auto-fix@github-actions"
+          GIT_COMMITTER_NAME: "MSR Auto-Fix Agent"
+          GIT_COMMITTER_EMAIL: "auto-fix@github-actions"
+
+      # ----------------------------------------------------------------
+      # 7. Notify (always — success or failure)
+      # ----------------------------------------------------------------
+      - name: Notify
+        if: always()
+        run: python scripts/notifier.py
+        env:
+          GITHUB_JOB_STATUS: ${{ job.status }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
