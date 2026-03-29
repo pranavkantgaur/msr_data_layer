@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       base_url:
-        description: "MSR server base URL (leave blank to skip live endpoint checks)"
+        description: "MSR server base URL. Leave blank to auto-start server on localhost:8000."
         required: false
         default: ""
 
@@ -20,12 +20,14 @@ jobs:
       pull-requests: write   # to open PRs via gh CLI
 
     env:
-      # LLM backend — mirrors the repo's priority order
+      # LLM backend — mirrors the repo's priority order.
+      # MSR_GITHUB_TOKEN is used both for the LLM (GitHub Models API)
+      # and forwarded to the server process for RAG queries.
       MSR_OPENAI_API_KEY: ${{ secrets.MSR_OPENAI_API_KEY }}
       MSR_GITHUB_TOKEN: ${{ secrets.MSR_GITHUB_TOKEN || github.token }}
       MSR_OPENAI_MODEL: ${{ secrets.MSR_OPENAI_MODEL || 'gpt-4o-mini' }}
-      # Plant data server (empty = skip live endpoint checks)
-      MSR_BASE_URL: ${{ inputs.base_url || '' }}
+      # When base_url is empty, run_notebook.py auto-starts server.py on localhost:8000
+      MSR_BASE_URL: ${{ inputs.base_url || 'http://localhost:8000' }}
       MSR_API_KEY: ${{ secrets.MSR_API_KEY }}
       # Notifications
       EMAIL_USER: ${{ secrets.EMAIL_USER }}
@@ -68,24 +70,29 @@ jobs:
 
       # ----------------------------------------------------------------
       # 4. Run the demo notebook
+      #    run_notebook.py auto-starts server.py on localhost:8000 when
+      #    MSR_BASE_URL points to localhost.  MSR_GITHUB_TOKEN is
+      #    forwarded to the server so the RAG pipeline can call the
+      #    GitHub Models LLM API.
       # ----------------------------------------------------------------
       - name: Run demo notebook
         id: notebook
         run: python scripts/run_notebook.py
         env:
-          # KB directory inside the runner workspace (ephemeral is fine for smoke tests)
           MSR_KB_DIR: /tmp/kb_store
-          NOTEBOOK_TIMEOUT: "120"
+          NOTEBOOK_TIMEOUT: "300"
           NOTEBOOK_RETRIES: "2"
+          SERVER_READY_TIMEOUT: "60"
         continue-on-error: true   # allow subsequent steps even on failure
 
       # ----------------------------------------------------------------
-      # 5. Health check (only when a server URL is configured)
+      # 5. Health check against the server (uses same MSR_BASE_URL)
       # ----------------------------------------------------------------
       - name: Health check
         id: health
-        if: env.MSR_BASE_URL != ''
         run: python scripts/health_check.py
+        env:
+          MSR_BASE_URL: ${{ inputs.base_url || 'http://localhost:8000' }}
         continue-on-error: true
 
       # ----------------------------------------------------------------

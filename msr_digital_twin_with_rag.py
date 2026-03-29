@@ -332,17 +332,29 @@ class RandomProjectionEmbeddingEngine(EmbeddingEngine):
 
 
 class OpenAIEmbeddingEngine(EmbeddingEngine):
-    """Embedding engine backed by an OpenAI-compatible /embeddings endpoint."""
+    """Embedding engine backed by an OpenAI-compatible /embeddings endpoint.
+
+    Falls back to :class:`RandomProjectionEmbeddingEngine` automatically
+    when the API endpoint is unreachable (e.g. DNS failure, network sandbox,
+    or offline environment).  Once a network error is detected all subsequent
+    calls use the same fallback engine so that embedding dimensions are
+    consistent across ingestion and retrieval.
+    """
 
     def __init__(self, api_key: str, base_url: str, model: str) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._model = model
+        self._fallback: RandomProjectionEmbeddingEngine | None = None
 
     def embed(self, text: str) -> list[float]:
         return self.embed_batch([text])[0]
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        # If we have already detected the API is unreachable, use the fallback.
+        if self._fallback is not None:
+            return self._fallback.embed_batch(texts)
+
         payload = json.dumps({"model": self._model, "input": texts}).encode()
         req = urllib.request.Request(
             f"{self._base_url}/embeddings",
@@ -352,8 +364,21 @@ class OpenAIEmbeddingEngine(EmbeddingEngine):
                 "Content-Type": "application/json",
             },
         )
-        data = json.loads(_http_request_with_backoff(req, timeout=30).decode())
-        return [item["embedding"] for item in data["data"]]
+        try:
+            data = json.loads(_http_request_with_backoff(req, timeout=30).decode())
+            return [item["embedding"] for item in data["data"]]
+        except (urllib.error.URLError, OSError) as exc:
+            # Network is unreachable (DNS failure, connection refused, sandbox
+            # blocking, etc.).  Switch permanently to the random-projection
+            # fallback so all subsequent ingestion and retrieval calls are
+            # consistent (same dimensionality).
+            logger.warning(
+                "[RAG] Embedding API unreachable (%s); "
+                "switching to random-projection fallback for this session.",
+                exc,
+            )
+            self._fallback = RandomProjectionEmbeddingEngine()
+            return self._fallback.embed_batch(texts)
 
 
 # ---------------------------------------------------------------------------
