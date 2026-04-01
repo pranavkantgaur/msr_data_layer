@@ -1,0 +1,14 @@
+# Dependencies for the DeepLynx RAG sidecar.
+# All packages are standard Python or already in requirements_mcp.txt.
+# No new packages are required beyond what Python 3.12 stdlib provides.
+# Optional packages (for GPU embedding and testing) are listed below.
+
+# ── required (stdlib only, no pip install needed) ───────────────────────────
+# json, math, hashlib, re, urllib.request, http.server, argparse, logging, sys
+
+# ── optional: GPU embedding ──────────────────────────────────────────────────
+# sentence-transformers>=2.2.0
+# torch>=2.0.0
+
+# ── optional: testing ────────────────────────────────────────────────────────
+pytest>=7.0.0
