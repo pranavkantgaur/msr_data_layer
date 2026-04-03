@@ -705,3 +705,211 @@ class TestMSRDigitalTwinRAGGPU:
 def test_json_encode_decode_roundtrip():
     obj = {"key": [1, 2, 3], "nested": {"a": True}}
     assert json_decode(json_encode(obj)) == obj
+
+
+# ---------------------------------------------------------------------------
+# web_search + _fetch_webpage_text (internet search helpers)
+# ---------------------------------------------------------------------------
+
+from msr_digital_twin_with_rag import (  # noqa: E402
+    WebSearchResult,
+    _fetch_webpage_text,
+    _WEB_PAGE_MAX_CHARS,
+    web_search,
+)
+
+
+def test_web_search_returns_empty_without_api_key(monkeypatch):
+    """Without MSR_SERPER_API_KEY the function returns an empty list (stub mode)."""
+    monkeypatch.delenv("MSR_SERPER_API_KEY", raising=False)
+    results = web_search("316L stainless steel FLiNaK corrosion")
+    assert results == []
+
+
+def test_web_search_result_dataclass():
+    """WebSearchResult holds title, url, snippet."""
+    r = WebSearchResult(title="Test", url="https://example.com", snippet="A snippet.")
+    assert r.title == "Test"
+    assert r.url == "https://example.com"
+    assert r.snippet == "A snippet."
+
+
+def test_web_search_returns_results_with_mock(monkeypatch):
+    """When MSR_SERPER_API_KEY is set and Serper returns results, parse them correctly."""
+    import urllib.request
+
+    monkeypatch.setenv("MSR_SERPER_API_KEY", "fake-serper-key")
+
+    fake_response = json.dumps({
+        "organic": [
+            {"title": "ORNL 316L study", "link": "https://ornl.gov/paper1", "snippet": "316L in FLiNaK"},
+            {"title": "Copenhagen Atomics", "link": "https://ca.dk/paper2", "snippet": "Salt purity"},
+        ]
+    }).encode()
+
+    def fake_urlopen(req, timeout=30):
+        class FakeResp:
+            def read(self):
+                return fake_response
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        return FakeResp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    results = web_search("316L FLiNaK", num_results=5)
+    assert len(results) == 2
+    assert results[0].title == "ORNL 316L study"
+    assert results[0].url == "https://ornl.gov/paper1"
+    assert results[1].snippet == "Salt purity"
+
+
+def test_web_search_clamps_num_results(monkeypatch):
+    """num_results is clamped to [1, 10]."""
+    import urllib.request
+
+    monkeypatch.setenv("MSR_SERPER_API_KEY", "fake-key")
+    fake_response = json.dumps({"organic": []}).encode()
+
+    captured_payload: list[dict] = []
+
+    def fake_urlopen(req, timeout=30):
+        import json as _json
+        captured_payload.append(_json.loads(req.data))
+        class FakeResp:
+            def read(self): return fake_response
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        return FakeResp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    web_search("test", num_results=999)
+    assert captured_payload[0]["num"] == 10
+
+    captured_payload.clear()
+    web_search("test", num_results=0)
+    assert captured_payload[0]["num"] == 1
+
+
+def test_web_search_handles_api_error_gracefully(monkeypatch):
+    """Network error returns empty list, does not raise."""
+    import urllib.request
+    import urllib.error
+
+    monkeypatch.setenv("MSR_SERPER_API_KEY", "fake-key")
+
+    def bad_urlopen(req, timeout=30):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", bad_urlopen)
+
+    results = web_search("test query")
+    assert results == []
+
+
+def test_fetch_webpage_text_truncates(monkeypatch):
+    """Returned text is truncated to _WEB_PAGE_MAX_CHARS characters."""
+    import urllib.request
+
+    long_text = "A" * (_WEB_PAGE_MAX_CHARS * 2)
+
+    def fake_urlopen(req, timeout=30):
+        class FakeResp:
+            def read(self): return long_text.encode()
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        return FakeResp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.delenv("MSR_JINA_API_KEY", raising=False)
+
+    text = _fetch_webpage_text("https://example.com/page")
+    assert len(text) <= _WEB_PAGE_MAX_CHARS
+
+
+def test_fetch_webpage_text_uses_jina_reader_url(monkeypatch):
+    """When MSR_JINA_API_KEY is set, the Jina reader URL is used."""
+    import urllib.request
+
+    monkeypatch.setenv("MSR_JINA_API_KEY", "fake-jina-key")
+    captured_urls: list[str] = []
+
+    def fake_urlopen(req, timeout=30):
+        captured_urls.append(req.full_url)
+        class FakeResp:
+            def read(self): return b"page content"
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        return FakeResp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    _fetch_webpage_text("https://example.com/doc")
+    assert any("r.jina.ai" in u for u in captured_urls)
+
+
+def test_fetch_webpage_text_returns_empty_on_error(monkeypatch):
+    """Network errors return an empty string, not an exception."""
+    import urllib.request
+    import urllib.error
+
+    monkeypatch.delenv("MSR_JINA_API_KEY", raising=False)
+
+    def bad_urlopen(req, timeout=30):
+        raise urllib.error.URLError("timeout")
+
+    monkeypatch.setattr(urllib.request, "urlopen", bad_urlopen)
+
+    text = _fetch_webpage_text("https://example.com/fail")
+    assert text == ""
+
+
+def test_deep_research_no_llm_includes_web_sources_key(tmp_path, monkeypatch):
+    """Even in no-LLM mode, deep_research returns web_sources and web_source_count keys."""
+    monkeypatch.delenv("MSR_SERPER_API_KEY", raising=False)
+    monkeypatch.delenv("MSR_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("MSR_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("MSR_USE_LOCAL_GPU", raising=False)
+
+    rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
+    result = rag.deep_research("What corrosion occurs in FLiNaK?")
+    assert "web_sources" in result
+    assert "web_source_count" in result
+    assert isinstance(result["web_sources"], list)
+    assert result["web_source_count"] == 0  # no Serper key → no web search
+
+
+def test_deep_research_with_mock_web_search(tmp_path, monkeypatch):
+    """deep_research incorporates web search results when MSR_SERPER_API_KEY is set."""
+    import urllib.request
+
+    monkeypatch.setenv("MSR_SERPER_API_KEY", "fake-key")
+    monkeypatch.setenv("MSR_WEB_SEARCH_RESULTS_PER_QUERY", "1")
+    monkeypatch.delenv("MSR_JINA_API_KEY", raising=False)
+
+    fake_serper = json.dumps({
+        "organic": [{"title": "Test Result", "link": "https://test.example.com/paper", "snippet": "Relevant snippet"}]
+    }).encode()
+    fake_page = b"Full page content about FLiNaK corrosion."
+
+    def fake_urlopen(req, timeout=30):
+        body = fake_serper if "serper.dev" in req.full_url else fake_page
+        class FakeResp:
+            def read(self): return body
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        return FakeResp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    # Mock the LLM so we don't need real API keys
+    rag = MSRDigitalTwinRAG(docs_dir=tmp_path / "docs")
+    rag._llm_generate = lambda messages, max_tokens: "Mocked LLM response."
+    rag._has_llm = lambda: True
+
+    result = rag.deep_research("What corrosion happens in FLiNaK?", top_k=1)
+    assert "web_sources" in result
+    assert "https://test.example.com/paper" in result["web_sources"]
+    assert result["web_source_count"] >= 1
+

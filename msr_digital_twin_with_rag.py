@@ -615,6 +615,141 @@ class SubQuery:
     instructions: str
 
 
+@dataclasses.dataclass
+class WebSearchResult:
+    """
+    One result returned by an internet search engine.
+
+    Populated by :func:`web_search` from the Serper.dev Google Search API.
+    When the API key is absent the list is empty (stub / offline mode).
+    """
+
+    title: str
+    url: str
+    snippet: str
+
+
+# ---------------------------------------------------------------------------
+# Internet search helpers (Serper.dev + Jina.ai reader)
+# ---------------------------------------------------------------------------
+
+#: Maximum characters to retain from a fetched web page (avoids huge LLM prompts).
+_WEB_PAGE_MAX_CHARS = 8_000
+
+#: Maximum web pages to fetch (full text) per sub-query.
+_MAX_PAGES_PER_QUERY = 2
+
+
+def web_search(
+    query: str,
+    num_results: int = 5,
+    serper_api_key: str = "",
+) -> list[WebSearchResult]:
+    """
+    Search the internet for *query* using the Serper.dev Google Search API.
+
+    Returns title, URL, and snippet for up to *num_results* organic results.
+
+    Stub behaviour
+    --------------
+    When *serper_api_key* is absent **and** the ``MSR_SERPER_API_KEY``
+    environment variable is not set, the function returns an empty list so
+    that the rest of the pipeline works with zero external dependencies (local
+    dev and unit tests require no API key).
+
+    Args:
+        query: Search query string.
+        num_results: Maximum number of organic results to return (1–10).
+        serper_api_key: Serper.dev API key.  Reads ``MSR_SERPER_API_KEY``
+            from the environment when not provided explicitly.
+
+    Returns:
+        List of :class:`WebSearchResult`.  Empty when no API key is set or
+        on any network / API error.
+    """
+    import sys
+
+    api_key = serper_api_key or os.environ.get("MSR_SERPER_API_KEY", "")
+    if not api_key:
+        logger.debug(
+            "[web_search] MSR_SERPER_API_KEY not set – returning stub (no internet search)"
+        )
+        return []
+
+    num_results = max(1, min(num_results, 10))
+    payload = json.dumps({"q": query, "num": num_results}).encode()
+    req = urllib.request.Request(
+        "https://google.serper.dev/search",
+        data=payload,
+        headers={
+            "X-API-KEY": api_key,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        data = json.loads(_http_request_with_backoff(req, timeout=15).decode())
+        results: list[WebSearchResult] = []
+        for item in data.get("organic", [])[:num_results]:
+            results.append(
+                WebSearchResult(
+                    title=item.get("title", ""),
+                    url=item.get("link", ""),
+                    snippet=item.get("snippet", ""),
+                )
+            )
+        logger.info(
+            "[web_search] query=%r results=%d", query[:60], len(results)
+        )
+        return results
+    except Exception as exc:  # noqa: BLE001
+        print(f"[web_search] Serper search failed ({exc!r}), returning empty.", file=sys.stderr)
+        return []
+
+
+def _fetch_webpage_text(url: str, jina_api_key: str = "") -> str:
+    """
+    Fetch the readable text content of a web page.
+
+    Uses the `Jina.ai reader API <https://jina.ai>`_ (``https://r.jina.ai/``)
+    when ``MSR_JINA_API_KEY`` is set, which strips navigation and ads and
+    returns clean Markdown-formatted text.  Falls back to a direct plain-text
+    GET with best-effort HTML stripping when no Jina key is available.
+
+    The returned text is truncated to :data:`_WEB_PAGE_MAX_CHARS` characters.
+
+    Args:
+        url: The URL to fetch.
+        jina_api_key: Jina.ai API key.  Reads ``MSR_JINA_API_KEY`` from the
+            environment when not provided explicitly.
+
+    Returns:
+        Readable text content of the page, or an empty string on any failure.
+    """
+    import sys
+
+    api_key = jina_api_key or os.environ.get("MSR_JINA_API_KEY", "")
+    try:
+        if api_key:
+            reader_url = f"https://r.jina.ai/{url}"
+            headers: dict[str, str] = {
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "text/plain",
+                "X-Return-Format": "markdown",
+            }
+        else:
+            reader_url = url
+            headers = {"User-Agent": "msr-data-layer/1.0 (MSR deep research)"}
+        req = urllib.request.Request(reader_url, headers=headers)
+        raw = _http_request_with_backoff(req, timeout=20).decode("utf-8", errors="replace")
+        # Minimal HTML tag removal for the direct-fetch fallback
+        text = re.sub(r"<[^>]+>", " ", raw)
+        text = re.sub(r"\s{3,}", "\n\n", text).strip()
+        return text[:_WEB_PAGE_MAX_CHARS]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[fetch_page] Failed to fetch {url!r} ({exc!r})", file=sys.stderr)
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # Knowledge base (persistent)
 # ---------------------------------------------------------------------------
@@ -1538,13 +1673,35 @@ class MSRDigitalTwinRAG:
         trace_id: str = "",
     ) -> dict[str, Any]:
         """
-        Conduct a deep research pass on *question* using an expanded retrieval window.
+        Conduct a deep research pass on *question* using internet search +
+        expanded local KB retrieval, following the agentic loop pattern of
+        `Alibaba DeepResearch <https://github.com/Alibaba-NLP/DeepResearch>`_.
 
-        Compared to :meth:`answer`, this method retrieves more documents per
-        sub-query (default *top_k* = 15 vs 5), accumulates the full set of
-        distinct source documents referenced across all sub-queries, and
-        produces a longer research report that includes explicit numbered
-        citations and closes with a section on open questions.
+        For each decomposed sub-query the method runs in parallel:
+
+        1. **Local KB retrieval** – hybrid dense + sparse search over the
+           ingested ORNL archive, academic papers, and plant data.
+        2. **Internet search** – Google search via the Serper.dev API
+           (requires ``MSR_SERPER_API_KEY``).  Returns web snippets.
+        3. **Web page fetching** – full readable text of the top
+           ``MSR_WEB_SEARCH_RESULTS_PER_QUERY`` web results via the Jina.ai
+           reader API (requires ``MSR_JINA_API_KEY``; falls back to direct
+           HTTP with HTML stripping when key is absent).
+
+        All three stages have stub/fallback behaviour so the method works
+        with zero external services when the API keys are not set.
+
+        Environment Variables
+        ---------------------
+        MSR_SERPER_API_KEY
+            Serper.dev API key for Google web search.  When absent, internet
+            search is skipped silently (local KB is still searched).
+        MSR_JINA_API_KEY
+            Jina.ai API key for clean web-page text extraction.  When absent,
+            pages are fetched directly with a plain HTTP GET (best-effort).
+        MSR_WEB_SEARCH_RESULTS_PER_QUERY
+            Number of web results to retrieve per sub-query (default 3,
+            capped at 5).  Fetching is skipped when the value is 0.
 
         Args:
             question: Natural-language research question.
@@ -1557,20 +1714,36 @@ class MSRDigitalTwinRAG:
             ``report``
                 The synthesised research report (string).
             ``sources``
-                Ordered list of distinct source identifiers cited across all
-                sub-queries (ordered by first appearance).
+                Ordered list of distinct KB source identifiers cited across
+                all sub-queries (ordered by first appearance).
             ``source_count``
-                Number of distinct sources referenced.
+                Number of distinct KB sources referenced.
+            ``web_sources``
+                Ordered list of distinct web URLs fetched (ordered by first
+                appearance).  Empty when internet search is disabled.
+            ``web_source_count``
+                Number of distinct web sources fetched.
         """
         import sys
 
         req_id = trace_id or "no-trace-id"
         started = time.perf_counter()
-        logger.info("[deep_research:%s] start top_k=%d", req_id, top_k)
+
+        # Read web-search config from environment
+        _serper_key = os.environ.get("MSR_SERPER_API_KEY", "")
+        _jina_key = os.environ.get("MSR_JINA_API_KEY", "")
+        _web_n = int(os.environ.get("MSR_WEB_SEARCH_RESULTS_PER_QUERY", "3"))
+        _web_n = max(0, min(_web_n, 5))
+        _web_enabled = bool(_serper_key) and _web_n > 0
+
+        logger.info(
+            "[deep_research:%s] start top_k=%d web_enabled=%s web_n=%d",
+            req_id, top_k, _web_enabled, _web_n,
+        )
 
         reactor_context = self._fetch_reactor_context()
 
-        # No-LLM fallback: return raw context summary
+        # No-LLM fallback: return raw context + KB chunks summary
         if not self._has_llm():
             chunks = self._kb.search(question, top_k=top_k)
             sources = list(dict.fromkeys(c["source"] for c in chunks if c.get("source")))
@@ -1584,6 +1757,8 @@ class MSRDigitalTwinRAG:
                 ),
                 "sources": sources,
                 "source_count": len(sources),
+                "web_sources": [],
+                "web_source_count": 0,
             }
 
         # Step 1 – decompose question into targeted sub-queries
@@ -1602,19 +1777,24 @@ class MSRDigitalTwinRAG:
             (time.perf_counter() - t_decompose) * 1000.0,
         )
 
-        # Step 2 – parallel retrieval: run sub-queries, collect answers + sources
+        # Step 2 – parallel retrieval: KB search + internet search per sub-query
         sub_answers: list[str] = []
-        source_order: list[str] = []  # preserves first-seen appearance order
+        source_order: list[str] = []   # KB source IDs, first-seen order
+        web_source_order: list[str] = []  # web URLs, first-seen order
 
-        def _run_sq(sq: SubQuery) -> tuple[str, list[str]]:
-            """Run one sub-query; return (partial_answer, source_ids)."""
+        def _run_sq(sq: SubQuery) -> tuple[str, list[str], list[str]]:
+            """
+            Run one sub-query against the KB and (optionally) the internet.
+
+            Returns (partial_answer, kb_source_ids, web_urls).
+            """
+            # --- KB retrieval ---
             chunks = self._kb.search(sq.term, top_k=top_k)
-            sq_sources = list(
+            sq_kb_sources = list(
                 dict.fromkeys(c["source"] for c in chunks if c.get("source"))
             )
-            if not chunks:
-                return "", sq_sources
-            doc_context = self._format_chunks(chunks)
+            kb_context = self._format_chunks(chunks) if chunks else ""
+
             seen_src: set[str] = set()
             insight_lines: list[str] = []
             for c in chunks:
@@ -1626,19 +1806,64 @@ class MSRDigitalTwinRAG:
                         f"Summary: {c['source_summary']}\n"
                         f"Topics: {', '.join(c.get('source_topics', []))}"
                     )
+
+            # --- Internet search ---
+            web_results: list[WebSearchResult] = []
+            web_page_texts: list[str] = []
+            sq_web_urls: list[str] = []
+
+            if _web_enabled:
+                web_results = web_search(sq.term, num_results=_web_n, serper_api_key=_serper_key)
+                sq_web_urls = [r.url for r in web_results if r.url]
+                # Fetch page text for each result (in a nested thread pool so
+                # page fetches don't block each other)
+                if web_results:
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(len(web_results), _MAX_PAGES_PER_QUERY)
+                    ) as page_pool:
+                        page_futures = [
+                            page_pool.submit(
+                                _fetch_webpage_text, r.url, _jina_key
+                            )
+                            for r in web_results[:_MAX_PAGES_PER_QUERY]
+                        ]
+                        for pf in concurrent.futures.as_completed(page_futures):
+                            text = pf.result()
+                            if text:
+                                web_page_texts.append(text)
+
+            # --- Build context sections ---
             parts = [
                 f"Search term: {sq.term}",
                 f"Instructions: {sq.instructions}",
                 "",
-                "## Retrieved Documents",
-                doc_context,
             ]
+            if kb_context:
+                parts += ["## Knowledge-Base Documents", kb_context]
             if insight_lines:
-                parts += ["", "## Source Insights", "\n".join(insight_lines)]
+                parts += ["", "## KB Source Insights", "\n".join(insight_lines)]
+
+            if web_results:
+                snippet_lines = [
+                    f"  [{i + 1}] {r.title}\n      URL: {r.url}\n      Snippet: {r.snippet}"
+                    for i, r in enumerate(web_results)
+                ]
+                parts += ["", "## Web Search Results", "\n".join(snippet_lines)]
+
+            if web_page_texts:
+                page_sections = "\n\n---\n\n".join(
+                    f"[Web Page {i + 1}]\n{t}" for i, t in enumerate(web_page_texts)
+                )
+                parts += ["", "## Web Page Text", page_sections]
+
+            if not kb_context and not web_results:
+                return "", sq_kb_sources, sq_web_urls
+
             parts += ["", "Extract the information relevant to the instructions above."]
+
             try:
                 partial = self._llm_generate(
-                    [{"role": "user", "content": "\n".join(parts)}], 512
+                    [{"role": "user", "content": "\n".join(parts)}], 768
                 )
             except Exception as exc:  # noqa: BLE001
                 print(
@@ -1646,23 +1871,27 @@ class MSRDigitalTwinRAG:
                     file=sys.stderr,
                 )
                 partial = f"[Sub-query error: {exc}]"
-            return partial, sq_sources
+            return partial, sq_kb_sources, sq_web_urls
 
         t_sub = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
             futures = {pool.submit(_run_sq, sq): sq for sq in sub_queries}
             for future in concurrent.futures.as_completed(futures):
-                sq_answer, sq_sources = future.result()
+                sq_answer, sq_kb_srcs, sq_web_urls = future.result()
                 if sq_answer:
                     sub_answers.append(sq_answer)
-                for src in sq_sources:
+                for src in sq_kb_srcs:
                     if src not in source_order:
                         source_order.append(src)
+                for url in sq_web_urls:
+                    if url not in web_source_order:
+                        web_source_order.append(url)
         logger.info(
-            "[deep_research:%s] stage=sub_queries answers=%d sources=%d elapsed_ms=%.1f",
+            "[deep_research:%s] stage=sub_queries answers=%d kb_sources=%d web_sources=%d elapsed_ms=%.1f",
             req_id,
             len(sub_answers),
             len(source_order),
+            len(web_source_order),
             (time.perf_counter() - t_sub) * 1000.0,
         )
 
@@ -1671,22 +1900,28 @@ class MSRDigitalTwinRAG:
             f"[Finding {i + 1}]\n{ans}"
             for i, ans in enumerate(sub_answers)
             if ans
-        ) or "[No relevant information found in the knowledge base]"
+        ) or "[No relevant information found in the knowledge base or on the web]"
 
-        source_list_text = (
+        kb_source_list_text = (
             "\n".join(f"  [{i + 1}] {src}" for i, src in enumerate(source_order))
             if source_order
             else "  (none identified)"
+        )
+        web_source_list_text = (
+            "\n".join(f"  [{i + 1}] {url}" for i, url in enumerate(web_source_order))
+            if web_source_order
+            else "  (none – MSR_SERPER_API_KEY not set or web search returned no results)"
         )
 
         synthesis_prompt = textwrap.dedent(f"""\
             You are an expert research assistant for Molten Salt Reactor (MSR)
             science and engineering.  Produce a comprehensive, well-structured
-            research report that answers the question below, drawing on the
-            research findings provided.  Include specific numerical values,
-            cite the numbered sources where possible (e.g. [1], [2]), and
-            close with a short section on open questions or areas for further
-            investigation.
+            research report that answers the question below, drawing on all
+            research findings provided (from the MSR knowledge base AND from
+            internet search results).  Include specific numerical values,
+            cite the numbered KB sources and web sources where possible
+            (e.g. [KB-1], [W-2]), and close with a short section on open
+            questions or areas for further investigation.
 
             ## Live Plant Data
             {reactor_context}
@@ -1694,8 +1929,11 @@ class MSRDigitalTwinRAG:
             ## Research Findings
             {findings}
 
-            ## Sources Referenced
-            {source_list_text}
+            ## Knowledge-Base Sources
+            {kb_source_list_text}
+
+            ## Web Sources
+            {web_source_list_text}
 
             ## Research Question
             {question}
@@ -1729,6 +1967,8 @@ class MSRDigitalTwinRAG:
             "report": report,
             "sources": source_order,
             "source_count": len(source_order),
+            "web_sources": web_source_order,
+            "web_source_count": len(web_source_order),
         }
 
     def _fetch_reactor_context(self) -> str:

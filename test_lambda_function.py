@@ -99,6 +99,8 @@ def mock_rag():
         "report": "Comprehensive research report on the topic.",
         "sources": ["ornl_report_1", "openalex_paper_2"],
         "source_count": 2,
+        "web_sources": [],
+        "web_source_count": 0,
     }
     rag.load_msr_archive.return_value = 3
     rag.update_openalex.return_value = 2
@@ -407,6 +409,8 @@ class TestDeepResearchEndpoint:
             "report": "Detailed research report.",
             "sources": ["doc_1", "doc_2"],
             "source_count": 2,
+            "web_sources": ["https://example.com/page"],
+            "web_source_count": 1,
         }
         lf._rag_cache = mock_rag
         event = _apigw_event(
@@ -416,6 +420,8 @@ class TestDeepResearchEndpoint:
         body = json.loads(resp["body"])
         assert body["sources"] == ["doc_1", "doc_2"]
         assert body["source_count"] == 2
+        assert body["web_sources"] == ["https://example.com/page"]
+        assert body["web_source_count"] == 1
         assert body["top_k"] == 15
 
 

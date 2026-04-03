@@ -92,6 +92,17 @@ MSR_LOCAL_EMBED_MODEL  HuggingFace embedding model (default:
 MSR_LOCAL_LLM_MODEL    HuggingFace generation model (default:
                        ``TinyLlama/TinyLlama-1.1B-Chat-v1.0``)
 MSR_HF_CACHE_DIR       HuggingFace model cache (default: ``/tmp/hf_cache``)
+MSR_SERPER_API_KEY     Serper.dev API key for Google web search in the
+                       ``POST /research/deep`` endpoint.  When absent, the
+                       internet-search step is skipped (local KB only).
+                       Get a key at https://serper.dev/
+MSR_JINA_API_KEY       Jina.ai API key for clean web-page text extraction in
+                       ``POST /research/deep``.  Optional – falls back to
+                       direct HTTP GET when absent.
+                       Get a key at https://jina.ai/
+MSR_WEB_SEARCH_RESULTS_PER_QUERY
+                       Number of web results to retrieve per sub-query in
+                       ``POST /research/deep`` (default 3, max 5).
 
 Deployment
 ----------
@@ -444,10 +455,15 @@ def _handle_deep_research(body: dict[str, Any], request_id: str = "") -> dict[st
     """
     ``POST /research/deep`` – deep research endpoint for AI research agents.
 
-    Runs an expanded multi-step RAG pipeline that retrieves more documents
-    per sub-query (default *top_k* = 15), collects all distinct source
-    identifiers referenced, and produces a comprehensive long-form research
-    report with numbered citations.
+    Runs an internet-augmented multi-step RAG pipeline inspired by the
+    `Alibaba DeepResearch <https://github.com/Alibaba-NLP/DeepResearch>`_
+    pattern: each decomposed sub-query searches **both** the local KB
+    (ORNL archive + ingested papers + plant data) **and** the internet via
+    the Serper.dev Google Search API, fetching full page text via Jina.ai.
+
+    Set ``MSR_SERPER_API_KEY`` (Serper.dev) and optionally
+    ``MSR_JINA_API_KEY`` (Jina.ai) to enable internet search.  When the
+    keys are absent, only the local KB is searched (stub mode).
 
     Request body::
 
@@ -461,8 +477,10 @@ def _handle_deep_research(body: dict[str, Any], request_id: str = "") -> dict[st
         {
           "question": "...",
           "report": "...",
-          "sources": ["source_id_1", "source_id_2", ...],
+          "sources": ["kb_source_id_1", ...],
           "source_count": 7,
+          "web_sources": ["https://example.com/paper", ...],
+          "web_source_count": 3,
           "top_k": 15
         }
     """
@@ -528,6 +546,8 @@ def _handle_deep_research(body: dict[str, Any], request_id: str = "") -> dict[st
         "report": result["report"],
         "sources": result["sources"],
         "source_count": result["source_count"],
+        "web_sources": result.get("web_sources", []),
+        "web_source_count": result.get("web_source_count", 0),
         "top_k": top_k,
     }
     if include_diagnostics:
