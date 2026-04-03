@@ -1531,6 +1531,206 @@ class MSRDigitalTwinRAG:
                 + findings
             )
 
+    def deep_research(
+        self,
+        question: str,
+        top_k: int = 15,
+        trace_id: str = "",
+    ) -> dict[str, Any]:
+        """
+        Conduct a deep research pass on *question* using an expanded retrieval window.
+
+        Compared to :meth:`answer`, this method retrieves more documents per
+        sub-query (default *top_k* = 15 vs 5), accumulates the full set of
+        distinct source documents referenced across all sub-queries, and
+        produces a longer research report that includes explicit numbered
+        citations and closes with a section on open questions.
+
+        Args:
+            question: Natural-language research question.
+            top_k: Number of KB chunks to retrieve per sub-query (default 15).
+            trace_id: Optional request ID for log correlation.
+
+        Returns:
+            A :class:`dict` with the following keys:
+
+            ``report``
+                The synthesised research report (string).
+            ``sources``
+                Ordered list of distinct source identifiers cited across all
+                sub-queries (ordered by first appearance).
+            ``source_count``
+                Number of distinct sources referenced.
+        """
+        import sys
+
+        req_id = trace_id or "no-trace-id"
+        started = time.perf_counter()
+        logger.info("[deep_research:%s] start top_k=%d", req_id, top_k)
+
+        reactor_context = self._fetch_reactor_context()
+
+        # No-LLM fallback: return raw context summary
+        if not self._has_llm():
+            chunks = self._kb.search(question, top_k=top_k)
+            sources = list(dict.fromkeys(c["source"] for c in chunks if c.get("source")))
+            prompt = self._build_simple_prompt(
+                question, self._format_chunks(chunks), reactor_context
+            )
+            return {
+                "report": (
+                    "[No LLM configured – set MSR_GITHUB_TOKEN, MSR_OPENAI_API_KEY, "
+                    "or MSR_USE_LOCAL_GPU=true to enable generation]\n\n" + prompt
+                ),
+                "sources": sources,
+                "source_count": len(sources),
+            }
+
+        # Step 1 – decompose question into targeted sub-queries
+        t_decompose = time.perf_counter()
+        sub_queries = _decompose_query(
+            question,
+            api_key=self._api_key,
+            base_url=self._base_url,
+            model=self._model,
+            generate_fn=self._llm_generate,
+        )
+        logger.info(
+            "[deep_research:%s] stage=decompose sub_queries=%d elapsed_ms=%.1f",
+            req_id,
+            len(sub_queries),
+            (time.perf_counter() - t_decompose) * 1000.0,
+        )
+
+        # Step 2 – parallel retrieval: run sub-queries, collect answers + sources
+        sub_answers: list[str] = []
+        source_order: list[str] = []  # preserves first-seen appearance order
+
+        def _run_sq(sq: SubQuery) -> tuple[str, list[str]]:
+            """Run one sub-query; return (partial_answer, source_ids)."""
+            chunks = self._kb.search(sq.term, top_k=top_k)
+            sq_sources = list(
+                dict.fromkeys(c["source"] for c in chunks if c.get("source"))
+            )
+            if not chunks:
+                return "", sq_sources
+            doc_context = self._format_chunks(chunks)
+            seen_src: set[str] = set()
+            insight_lines: list[str] = []
+            for c in chunks:
+                src = c.get("source", "")
+                if src and src not in seen_src and "source_summary" in c:
+                    seen_src.add(src)
+                    insight_lines.append(
+                        f"[Source: {src}]\n"
+                        f"Summary: {c['source_summary']}\n"
+                        f"Topics: {', '.join(c.get('source_topics', []))}"
+                    )
+            parts = [
+                f"Search term: {sq.term}",
+                f"Instructions: {sq.instructions}",
+                "",
+                "## Retrieved Documents",
+                doc_context,
+            ]
+            if insight_lines:
+                parts += ["", "## Source Insights", "\n".join(insight_lines)]
+            parts += ["", "Extract the information relevant to the instructions above."]
+            try:
+                partial = self._llm_generate(
+                    [{"role": "user", "content": "\n".join(parts)}], 512
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[RAG] Deep research sub-query '{sq.term}' LLM failed ({exc!r}).",
+                    file=sys.stderr,
+                )
+                partial = f"[Sub-query error: {exc}]"
+            return partial, sq_sources
+
+        t_sub = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(_run_sq, sq): sq for sq in sub_queries}
+            for future in concurrent.futures.as_completed(futures):
+                sq_answer, sq_sources = future.result()
+                if sq_answer:
+                    sub_answers.append(sq_answer)
+                for src in sq_sources:
+                    if src not in source_order:
+                        source_order.append(src)
+        logger.info(
+            "[deep_research:%s] stage=sub_queries answers=%d sources=%d elapsed_ms=%.1f",
+            req_id,
+            len(sub_answers),
+            len(source_order),
+            (time.perf_counter() - t_sub) * 1000.0,
+        )
+
+        # Step 3 – research-focused synthesis with explicit citations
+        findings = "\n\n".join(
+            f"[Finding {i + 1}]\n{ans}"
+            for i, ans in enumerate(sub_answers)
+            if ans
+        ) or "[No relevant information found in the knowledge base]"
+
+        source_list_text = (
+            "\n".join(f"  [{i + 1}] {src}" for i, src in enumerate(source_order))
+            if source_order
+            else "  (none identified)"
+        )
+
+        synthesis_prompt = textwrap.dedent(f"""\
+            You are an expert research assistant for Molten Salt Reactor (MSR)
+            science and engineering.  Produce a comprehensive, well-structured
+            research report that answers the question below, drawing on the
+            research findings provided.  Include specific numerical values,
+            cite the numbered sources where possible (e.g. [1], [2]), and
+            close with a short section on open questions or areas for further
+            investigation.
+
+            ## Live Plant Data
+            {reactor_context}
+
+            ## Research Findings
+            {findings}
+
+            ## Sources Referenced
+            {source_list_text}
+
+            ## Research Question
+            {question}
+
+            ## Report
+        """)
+
+        try:
+            t_synth = time.perf_counter()
+            report = self._llm_generate(
+                [{"role": "user", "content": synthesis_prompt}], 2048
+            )
+            logger.info(
+                "[deep_research:%s] stage=synthesize elapsed_ms=%.1f",
+                req_id,
+                (time.perf_counter() - t_synth) * 1000.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[RAG] Deep research synthesis failed ({exc!r}).", file=sys.stderr)
+            report = (
+                f"[Synthesis failed: {exc}. Returning raw research findings below:]\n\n"
+                + findings
+            )
+
+        logger.info(
+            "[deep_research:%s] complete total_elapsed_ms=%.1f",
+            req_id,
+            (time.perf_counter() - started) * 1000.0,
+        )
+        return {
+            "report": report,
+            "sources": source_order,
+            "source_count": len(source_order),
+        }
+
     def _fetch_reactor_context(self) -> str:
         try:
             with MSRDigitalTwinClient() as client:

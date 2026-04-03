@@ -13,25 +13,31 @@ handles all four concerns:
    pipeline so agents or operators can send a plain-text question and receive
    a synthesised answer without implementing MCP.
 
-3. **Knowledge-base update endpoint** (``POST /kb/update``) – triggers
+3. **Deep research endpoint** (``POST /research/deep``) – expanded RAG query
+   designed for deep research agents.  Retrieves a larger document window
+   (default top_k = 15), collects all distinct source identifiers cited across
+   sub-queries, and produces a comprehensive long-form research report with
+   numbered citations and an open-questions section.
+
+4. **Knowledge-base update endpoint** (``POST /kb/update``) – triggers
    ingestion from the static msr-archive and/or the dynamic OpenAlex source.
    Can also be invoked on a schedule via Amazon EventBridge (the same function
    is the target; see ``template.yaml``).
 
-4. **Plant data ingestion endpoint** (``POST /data/ingest``) – accepts plant
+5. **Plant data ingestion endpoint** (``POST /data/ingest``) – accepts plant
    operational data (sensor snapshots, event logs, maintenance reports) from
    operators or agents and ingests it into the RAG knowledge base.
 
-5. **Timeseries query endpoint** (``POST /timeseries/query``) – accepts either
+6. **Timeseries query endpoint** (``POST /timeseries/query``) – accepts either
    a structured ``{sensor_name, start_time, end_time, last_n, aggregation}``
    payload or a natural-language ``{question}`` payload and returns sensor
    readings or statistics from the SQLite timeseries store.
 
-6. **Timeseries ingest endpoint** (``POST /timeseries/ingest``) – accepts
+7. **Timeseries ingest endpoint** (``POST /timeseries/ingest``) – accepts
    ``{readings: [...], source_id, data_type}`` and inserts timestamped sensor
    readings into the SQLite timeseries store (and optionally the RAG KB).
 
-7. **Health endpoint** (``GET /health``) – returns 200 with service metadata
+8. **Health endpoint** (``GET /health``) – returns 200 with service metadata
    for load-balancer checks and uptime monitoring.
 
 Knowledge Base Persistence
@@ -434,6 +440,107 @@ def _handle_query(body: dict[str, Any], request_id: str = "") -> dict[str, Any]:
     return _response(200, response_body)
 
 
+def _handle_deep_research(body: dict[str, Any], request_id: str = "") -> dict[str, Any]:
+    """
+    ``POST /research/deep`` – deep research endpoint for AI research agents.
+
+    Runs an expanded multi-step RAG pipeline that retrieves more documents
+    per sub-query (default *top_k* = 15), collects all distinct source
+    identifiers referenced, and produces a comprehensive long-form research
+    report with numbered citations.
+
+    Request body::
+
+        {
+          "question": "What corrosion mechanisms affect 316L SS in FLiNaK?",
+          "top_k": 15          // optional, default 15, clamped to [1, 50]
+        }
+
+    Response::
+
+        {
+          "question": "...",
+          "report": "...",
+          "sources": ["source_id_1", "source_id_2", ...],
+          "source_count": 7,
+          "top_k": 15
+        }
+    """
+    req_id = request_id or uuid.uuid4().hex[:12]
+    question = body.get("question", "").strip()
+    if not question:
+        return _error(400, "Request body must include a non-empty 'question' field.")
+    top_k = int(body.get("top_k", 15))
+    top_k = max(1, min(top_k, 50))
+    include_diagnostics = bool(body.get("diagnostics") or body.get("debug"))
+
+    timeout_s = float(os.environ.get("MSR_DEEP_RESEARCH_TIMEOUT_SECONDS", "115"))
+    timeout_s = max(10.0, timeout_s)
+
+    logger.info(
+        "[deep_research:%s] start top_k=%d timeout_s=%.1f question_chars=%d",
+        req_id,
+        top_k,
+        timeout_s,
+        len(question),
+    )
+
+    rag = _get_rag()
+    started = time.perf_counter()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(rag.deep_research, question, top_k, req_id)
+            result = future.result(timeout=timeout_s)
+    except concurrent.futures.TimeoutError:
+        elapsed = (time.perf_counter() - started) * 1000.0
+        logger.error(
+            "[deep_research:%s] timeout after %.1fms",
+            req_id,
+            elapsed,
+        )
+        payload: dict[str, Any] = {
+            "error": f"Deep research timed out after {timeout_s:.1f}s",
+            "request_id": req_id,
+            "elapsed_ms": round(elapsed, 1),
+            "hint": (
+                "Deep research exceeded the configured timeout.  "
+                "Try a more specific question or reduce top_k."
+            ),
+        }
+        return _response(504, payload)
+    except Exception as exc:  # noqa: BLE001
+        elapsed = (time.perf_counter() - started) * 1000.0
+        logger.exception(
+            "[deep_research:%s] deep research failed after %.1fms", req_id, elapsed
+        )
+        payload = {
+            "error": f"Deep research failed: {exc}",
+            "request_id": req_id,
+            "elapsed_ms": round(elapsed, 1),
+        }
+        return _response(500, payload)
+
+    elapsed = (time.perf_counter() - started) * 1000.0
+    logger.info("[deep_research:%s] success elapsed_ms=%.1f", req_id, elapsed)
+
+    response_body: dict[str, Any] = {
+        "question": question,
+        "report": result["report"],
+        "sources": result["sources"],
+        "source_count": result["source_count"],
+        "top_k": top_k,
+    }
+    if include_diagnostics:
+        response_body["diagnostics"] = {
+            "request_id": req_id,
+            "elapsed_ms": round(elapsed, 1),
+            "timeout_seconds": timeout_s,
+            "question_chars": len(question),
+            "top_k": top_k,
+        }
+    return _response(200, response_body)
+
+
 def _handle_plant_data_ingest(body: dict[str, Any]) -> dict[str, Any]:
     """
     ``POST /data/ingest`` – ingest plant operational data into the KB.
@@ -725,6 +832,10 @@ def _route_http(event: dict[str, Any]) -> dict[str, Any]:
     # RAG query endpoint
     if path == "/query" and method == "POST":
         return _handle_query(parsed_body, request_id=request_id)
+
+    # Deep research endpoint
+    if path == "/research/deep" and method == "POST":
+        return _handle_deep_research(parsed_body, request_id=request_id)
 
     # KB update endpoint
     if path == "/kb/update" and method == "POST":

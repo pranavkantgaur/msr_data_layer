@@ -95,6 +95,11 @@ def mock_rag():
     """A MagicMock mimicking MSRDigitalTwinRAG."""
     rag = MagicMock()
     rag.answer.return_value = "The thermal efficiency is approximately 40%."
+    rag.deep_research.return_value = {
+        "report": "Comprehensive research report on the topic.",
+        "sources": ["ornl_report_1", "openalex_paper_2"],
+        "source_count": 2,
+    }
     rag.load_msr_archive.return_value = 3
     rag.update_openalex.return_value = 2
     rag.update_arxiv.return_value = 1
@@ -317,6 +322,105 @@ class TestQueryEndpoint:
         event = _apigw_event("POST", "/query", body={"question": "test"})
         resp = lf.lambda_handler(event, None)
         assert resp["statusCode"] == 500
+
+
+# ---------------------------------------------------------------------------
+# /research/deep endpoint
+# ---------------------------------------------------------------------------
+
+class TestDeepResearchEndpoint:
+    def test_valid_question(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        event = _apigw_event(
+            "POST",
+            "/research/deep",
+            body={"question": "What corrosion mechanisms affect 316L SS in FLiNaK?"},
+        )
+        resp = lf.lambda_handler(event, None)
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert "report" in body
+        assert "sources" in body
+        assert "source_count" in body
+        assert body["question"] == "What corrosion mechanisms affect 316L SS in FLiNaK?"
+        mock_rag.deep_research.assert_called_once()
+        call_question, call_top_k, _ = mock_rag.deep_research.call_args[0]
+        assert call_question == "What corrosion mechanisms affect 316L SS in FLiNaK?"
+        assert call_top_k == 15
+
+    def test_default_top_k_is_15(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        event = _apigw_event(
+            "POST", "/research/deep", body={"question": "chromium dissolution"}
+        )
+        lf.lambda_handler(event, None)
+        _, call_top_k, _ = mock_rag.deep_research.call_args[0]
+        assert call_top_k == 15
+
+    def test_custom_top_k(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        event = _apigw_event(
+            "POST", "/research/deep", body={"question": "hello?", "top_k": 30}
+        )
+        lf.lambda_handler(event, None)
+        _, call_top_k, _ = mock_rag.deep_research.call_args[0]
+        assert call_top_k == 30
+
+    def test_top_k_clamped_to_50(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        event = _apigw_event(
+            "POST", "/research/deep", body={"question": "hi", "top_k": 999}
+        )
+        lf.lambda_handler(event, None)
+        _, call_top_k, _ = mock_rag.deep_research.call_args[0]
+        assert call_top_k == 50
+
+    def test_empty_question_returns_400(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        event = _apigw_event(
+            "POST", "/research/deep", body={"question": "  "}
+        )
+        resp = lf.lambda_handler(event, None)
+        assert resp["statusCode"] == 400
+
+    def test_missing_question_returns_400(self, mock_rag):
+        import lambda_function as lf
+        lf._rag_cache = mock_rag
+        event = _apigw_event("POST", "/research/deep", body={})
+        resp = lf.lambda_handler(event, None)
+        assert resp["statusCode"] == 400
+
+    def test_rag_error_returns_500(self, mock_rag):
+        import lambda_function as lf
+        mock_rag.deep_research.side_effect = RuntimeError("KB unavailable")
+        lf._rag_cache = mock_rag
+        event = _apigw_event(
+            "POST", "/research/deep", body={"question": "test question"}
+        )
+        resp = lf.lambda_handler(event, None)
+        assert resp["statusCode"] == 500
+
+    def test_response_includes_sources_list(self, mock_rag):
+        import lambda_function as lf
+        mock_rag.deep_research.return_value = {
+            "report": "Detailed research report.",
+            "sources": ["doc_1", "doc_2"],
+            "source_count": 2,
+        }
+        lf._rag_cache = mock_rag
+        event = _apigw_event(
+            "POST", "/research/deep", body={"question": "test"}
+        )
+        resp = lf.lambda_handler(event, None)
+        body = json.loads(resp["body"])
+        assert body["sources"] == ["doc_1", "doc_2"]
+        assert body["source_count"] == 2
+        assert body["top_k"] == 15
 
 
 # ---------------------------------------------------------------------------

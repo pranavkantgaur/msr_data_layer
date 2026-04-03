@@ -52,6 +52,7 @@ Endpoints
 GET  /health                – liveness check
 POST /mcp                   – JSON-RPC 2.0 / MCP protocol
 POST /query                 – plain-text RAG query
+POST /research/deep         – deep research agent endpoint (expanded RAG + citations)
 POST /kb/update             – trigger KB ingestion (archive + OpenAlex + arXiv + S2)
 POST /data/ingest           – push plant operational data (text/event logs)
 POST /timeseries/ingest     – push timestamped sensor readings (structured)
@@ -225,7 +226,7 @@ def main(argv: list[str] | None = None) -> None:
         args.port,
     )
     logger.info(
-        "Endpoints: GET /health  POST /mcp  POST /query  "
+        "Endpoints: GET /health  POST /mcp  POST /query  POST /research/deep  "
         "POST /kb/update  POST /data/ingest  "
         "POST /timeseries/ingest  POST /timeseries/query"
     )
