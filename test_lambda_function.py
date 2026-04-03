@@ -345,9 +345,8 @@ class TestDeepResearchEndpoint:
         assert "source_count" in body
         assert body["question"] == "What corrosion mechanisms affect 316L SS in FLiNaK?"
         mock_rag.deep_research.assert_called_once()
-        call_question, call_top_k, _ = mock_rag.deep_research.call_args[0]
-        assert call_question == "What corrosion mechanisms affect 316L SS in FLiNaK?"
-        assert call_top_k == 15
+        assert mock_rag.deep_research.call_args.args[0] == "What corrosion mechanisms affect 316L SS in FLiNaK?"
+        assert mock_rag.deep_research.call_args.args[1] == 15
 
     def test_default_top_k_is_15(self, mock_rag):
         import lambda_function as lf
@@ -356,8 +355,7 @@ class TestDeepResearchEndpoint:
             "POST", "/research/deep", body={"question": "chromium dissolution"}
         )
         lf.lambda_handler(event, None)
-        _, call_top_k, _ = mock_rag.deep_research.call_args[0]
-        assert call_top_k == 15
+        assert mock_rag.deep_research.call_args.args[1] == 15
 
     def test_custom_top_k(self, mock_rag):
         import lambda_function as lf
@@ -366,8 +364,7 @@ class TestDeepResearchEndpoint:
             "POST", "/research/deep", body={"question": "hello?", "top_k": 30}
         )
         lf.lambda_handler(event, None)
-        _, call_top_k, _ = mock_rag.deep_research.call_args[0]
-        assert call_top_k == 30
+        assert mock_rag.deep_research.call_args.args[1] == 30
 
     def test_top_k_clamped_to_50(self, mock_rag):
         import lambda_function as lf
@@ -376,8 +373,7 @@ class TestDeepResearchEndpoint:
             "POST", "/research/deep", body={"question": "hi", "top_k": 999}
         )
         lf.lambda_handler(event, None)
-        _, call_top_k, _ = mock_rag.deep_research.call_args[0]
-        assert call_top_k == 50
+        assert mock_rag.deep_research.call_args.args[1] == 50
 
     def test_empty_question_returns_400(self, mock_rag):
         import lambda_function as lf
