@@ -702,7 +702,9 @@ def web_search(
         )
         return results
     except Exception as exc:  # noqa: BLE001
-        print(f"[web_search] Serper search failed ({exc!r}), returning empty.", file=sys.stderr)
+        logger.error(
+            "[web_search] Serper search failed for query %r: %s", query[:60], exc
+        )
         return []
 
 
@@ -746,7 +748,7 @@ def _fetch_webpage_text(url: str, jina_api_key: str = "") -> str:
         text = re.sub(r"\s{3,}", "\n\n", text).strip()
         return text[:_WEB_PAGE_MAX_CHARS]
     except Exception as exc:  # noqa: BLE001
-        print(f"[fetch_page] Failed to fetch {url!r} ({exc!r})", file=sys.stderr)
+        logger.error("[fetch_page] Failed to fetch %r: %s", url, exc)
         return ""
 
 
@@ -1866,9 +1868,8 @@ class MSRDigitalTwinRAG:
                     [{"role": "user", "content": "\n".join(parts)}], 768
                 )
             except Exception as exc:  # noqa: BLE001
-                print(
-                    f"[RAG] Deep research sub-query '{sq.term}' LLM failed ({exc!r}).",
-                    file=sys.stderr,
+                logger.error(
+                    "[deep_research:%s] sub_query %r LLM failed: %s", req_id, sq.term, exc
                 )
                 partial = f"[Sub-query error: {exc}]"
             return partial, sq_kb_sources, sq_web_urls
@@ -1952,7 +1953,7 @@ class MSRDigitalTwinRAG:
                 (time.perf_counter() - t_synth) * 1000.0,
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"[RAG] Deep research synthesis failed ({exc!r}).", file=sys.stderr)
+            logger.error("[deep_research:%s] synthesis failed: %s", req_id, exc)
             report = (
                 f"[Synthesis failed: {exc}. Returning raw research findings below:]\n\n"
                 + findings

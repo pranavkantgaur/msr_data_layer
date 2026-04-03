@@ -771,11 +771,11 @@ def test_web_search_clamps_num_results(monkeypatch):
     monkeypatch.setenv("MSR_SERPER_API_KEY", "fake-key")
     fake_response = json.dumps({"organic": []}).encode()
 
-    captured_payload: list[dict] = []
+    captured_payloads: list[dict] = []
 
     def fake_urlopen(req, timeout=30):
         import json as _json
-        captured_payload.append(_json.loads(req.data))
+        captured_payloads.append(_json.loads(req.data))
         class FakeResp:
             def read(self): return fake_response
             def __enter__(self): return self
@@ -785,11 +785,11 @@ def test_web_search_clamps_num_results(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     web_search("test", num_results=999)
-    assert captured_payload[0]["num"] == 10
+    assert captured_payloads[0]["num"] == 10
 
-    captured_payload.clear()
+    captured_payloads.clear()
     web_search("test", num_results=0)
-    assert captured_payload[0]["num"] == 1
+    assert captured_payloads[0]["num"] == 1
 
 
 def test_web_search_handles_api_error_gracefully(monkeypatch):
